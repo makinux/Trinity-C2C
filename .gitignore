@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 学習成果物 / 実行ログ
+coordinator_theta.npy
+*.output
+*.npy
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# HuggingFace キャッシュ（誤コミット防止）
+.cache/
+hf-cache/

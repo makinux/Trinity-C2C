@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+*.output
+coordinator_theta.npy
+docs/
+*.md
+*.svg
+.dockerignore
+docker-compose.yml

@@ -1,0 +1,69 @@
+# ============================================================
+# Trinity / C2C ローカル構成（config.yml）
+#   環境変数 TRINITY_CONFIG で別パス指定可。未指定なら ./config.yml。
+#   ファイルや pyyaml が無い場合は trinity_config.py の DEFAULTS で動作。
+#   *_URL 環境変数 (THINKER_URL/WORKER_URL/VERIFIER_URL) は base_url を上書き。
+#   秘密鍵は <ROLE>_API_KEY (例 WORKER_API_KEY) を env で渡すのが推奨（YAML平文を避ける）。
+# ============================================================
+
+# 役割ごとのモデル（OpenAI互換ローカルエンドポイント）
+models:
+  thinker:
+    name: GLM
+    base_url: http://localhost:8001/v1
+    model_id: glm-4
+    api_key: EMPTY
+    temperature: 0.6
+    max_tokens: 4096
+    # system_prompt: （省略時は prompts.thinker を使用）
+  worker:
+    name: Qwen3-Coder
+    base_url: http://localhost:8002/v1
+    model_id: qwen3-coder
+    api_key: EMPTY
+    temperature: 0.6
+    max_tokens: 4096
+  verifier:
+    name: DeepSeek-R1
+    base_url: http://localhost:8003/v1
+    model_id: deepseek-r1-distill
+    api_key: EMPTY
+    temperature: 0.6
+    max_tokens: 4096
+
+# 役割別システムプロンプト（models.<role>.system_prompt があればそちら優先）
+prompts:
+  thinker: "あなたはThinker。問題を分析し、高レベルの計画・分解・既存解への批評のみを返す。コードや最終解は書かない。"
+  worker: "あなたはWorker。これまでの計画と批評を踏まえ、最終解（完全なコード/導出/数値）を具体的に作る。"
+  verifier: "あなたはVerifier。最新のWorker成果物がクエリを正しく・完全に満たすか点検する。最終行に必ず 'VERDICT: ACCEPT' か 'VERDICT: REVISE' を出力。REVISEなら具体的修正点も述べる。"
+
+# オーケストレーション
+orchestration:
+  max_turns: 5
+  verbose: true
+
+# コーディネータ（学習）
+coordinator:
+  slm_model: Qwen/Qwen3-0.6B      # 特徴量を出す小型SLM
+  featurizer: qwen3               # qwen3 | mock
+  mask_no_artifact: true          # 成果物前のVerifyを禁止
+
+# sep-CMA-ES 学習
+training:
+  budget: 8000
+  sigma0: 0.3
+  m_reps: 8
+  seed: 0
+
+# 評価ハーネス
+eval:
+  trials: 1
+  timeout: 10.0
+  max_inputs: null                # null=全入力(EvalPlus忠実)。数値指定で上限
+
+# C2C（潜在融合）
+c2c:
+  sharer_model: HuggingFaceTB/SmolLM2-135M-Instruct
+  receiver_model: Qwen/Qwen2.5-0.5B-Instruct
+  init_gate: 0.05
+  tau: 1.0

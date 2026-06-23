@@ -1,0 +1,38 @@
+Trinity-C2C
+Copyright 2026 NSS Co., Ltd.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+本ソフトウェアは Apache License 2.0 の下で提供されます（LICENSE 参照）。
+
+================================================================================
+Non-affiliation / 独立・非公式である旨
+================================================================================
+This repository is an INDEPENDENT, UNOFFICIAL research and educational
+reimplementation of ideas described in publicly available papers. It is NOT
+affiliated with, endorsed by, or derived from the source code of the papers'
+authors or their institutions, and does not claim official compatibility.
+
+本リポジトリは、公開論文に記載された「着想」を独立に再実装した、非公式の
+研究/教育目的の成果物です。論文著者・各機関とは一切無関係であり、公式実装
+でも公式互換でもありません。論文本文・図表は転載していません。
+
+================================================================================
+Cited works — ideas only / 着想元の論文（本文・図表は不複製）
+================================================================================
+- Trinity: An Evolved LLM Coordinator.  arXiv:2512.04695
+- Cache-to-Cache: Direct Semantic Communication Between LLMs.  arXiv:2510.03215
+- Activated LoRA: Fine-tuned LLMs for Intrinsics.  arXiv:2504.12397
+- Efficient Multi-Adapter LLM Serving via Cross-Model KV-Cache Reuse with
+  Activated LoRA.  arXiv:2512.17910
+
+================================================================================
+Third-party models & datasets / 例で参照するモデル・データセット
+================================================================================
+Model and dataset identifiers (e.g., the Qwen, GLM, DeepSeek, and SmolLM model
+families; HumanEval+/MBPP+ via EvalPlus) appear only as configurable examples.
+Each is subject to its OWN license and terms from its respective provider.
+Users are responsible for complying with those licenses.
+
+例として参照するモデル/データセット（Qwen・GLM・DeepSeek・SmolLM 各系統、
+EvalPlus の HumanEval+/MBPP+ 等）は、それぞれの提供元のライセンス・利用規約に
+従ってください。各ライセンスの遵守は利用者の責任です。

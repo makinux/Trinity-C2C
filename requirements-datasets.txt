@@ -1,0 +1,2 @@
+# 任意: 実データセット(HumanEval+/MBPP+)を使う場合のみ。--build-arg WITH_DATASETS=1 で導入。
+evalplus>=0.3

@@ -1,0 +1,81 @@
+name: trinity-c2c
+
+# ───────────────────────────────────────────────────────────────
+# app: CPUアプリ像。セルフテスト/学習/評価/C2C実機検証を実行。
+#   既定コマンド = セルフテスト一括（モデル不要・GPU不要）。
+#   実機C2C : docker compose run --rm app python trinity_c2c_realrun.py
+#   学習    : docker compose run --rm app python trinity_train.py
+#   評価(実機GPU): docker compose --profile gpu up -d --wait   # ← healthyまで待つ
+#                 docker compose run --rm app python trinity_eval.py --trials 3
+# ───────────────────────────────────────────────────────────────
+services:
+  app:
+    build:
+      context: .
+      args:
+        WITH_DATASETS: ${WITH_DATASETS:-0}
+    image: trinity-c2c:latest
+    environment:
+      PYTHONUTF8: "1"
+      HF_TOKEN: ${HF_TOKEN:-}
+      THINKER_URL: ${THINKER_URL:-http://thinker:8000/v1}
+      WORKER_URL: ${WORKER_URL:-http://worker:8000/v1}
+      VERIFIER_URL: ${VERIFIER_URL:-http://verifier:8000/v1}
+    volumes:
+      - hf-cache:/root/.cache/huggingface     # ホストの ~/.cache/huggingface を bind しても可
+
+  # ───── GPU: ローカルLLMサーバ（OpenAI互換 vLLM）。要 NVIDIA GPU + nvidia-container-toolkit ─────
+  # 1サービス=1GPU確保。VRAM不足時は model/max-model-len/gpu-memory-utilization を調整。
+  thinker:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    shm_size: "8gb"
+    environment: { HF_TOKEN: "${HF_TOKEN:-}" }
+    volumes: [ "hf-cache:/root/.cache/huggingface" ]
+    command: ["--model", "${THINKER_MODEL:-THUDM/glm-4-9b-chat}",
+              "--served-model-name", "glm-4", "--port", "8000",
+              "--max-model-len", "4096", "--gpu-memory-utilization", "0.9"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/v1/models')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  worker:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    shm_size: "8gb"
+    environment: { HF_TOKEN: "${HF_TOKEN:-}" }
+    volumes: [ "hf-cache:/root/.cache/huggingface" ]
+    command: ["--model", "${WORKER_MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}",
+              "--served-model-name", "qwen3-coder", "--port", "8000",
+              "--max-model-len", "4096", "--gpu-memory-utilization", "0.9"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/v1/models')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  verifier:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    shm_size: "8gb"
+    environment: { HF_TOKEN: "${HF_TOKEN:-}" }
+    volumes: [ "hf-cache:/root/.cache/huggingface" ]
+    command: ["--model", "${VERIFIER_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}",
+              "--served-model-name", "deepseek-r1-distill", "--port", "8000",
+              "--max-model-len", "4096", "--gpu-memory-utilization", "0.9"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/v1/models')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+volumes:
+  hf-cache:
