@@ -1,13 +1,13 @@
 name: trinity-c2c
 
-# ───────────────────────────────────────────────────────────────
-# app: CPUアプリ像。セルフテスト/学習/評価/C2C実機検証を実行。
-#   既定コマンド = セルフテスト一括（モデル不要・GPU不要）。
-#   実機C2C : docker compose run --rm app python trinity_c2c_realrun.py
-#   学習    : docker compose run --rm app python trinity_train.py
-#   評価(実機GPU): docker compose --profile gpu up -d --wait   # ← healthyまで待つ
+# ---------------------------------------------------------------
+# app: CPU app image. Runs self-tests / training / evaluation / on-device C2C validation.
+#   Default command = full self-test suite (no model, no GPU needed).
+#   On-device C2C : docker compose run --rm app python trinity_c2c_realrun.py
+#   Training      : docker compose run --rm app python trinity_train.py
+#   Eval (GPU)    : docker compose --profile gpu up -d --wait   # <- wait until healthy
 #                 docker compose run --rm app python trinity_eval.py --trials 3
-# ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------
 services:
   app:
     build:
@@ -22,10 +22,10 @@ services:
       WORKER_URL: ${WORKER_URL:-http://worker:8000/v1}
       VERIFIER_URL: ${VERIFIER_URL:-http://verifier:8000/v1}
     volumes:
-      - hf-cache:/root/.cache/huggingface     # ホストの ~/.cache/huggingface を bind しても可
+      - hf-cache:/root/.cache/huggingface     # you may bind the host's ~/.cache/huggingface instead
 
-  # ───── GPU: ローカルLLMサーバ（OpenAI互換 vLLM）。要 NVIDIA GPU + nvidia-container-toolkit ─────
-  # 1サービス=1GPU確保。VRAM不足時は model/max-model-len/gpu-memory-utilization を調整。
+  # ----- GPU: local LLM servers (OpenAI-compatible vLLM). Requires NVIDIA GPU + nvidia-container-toolkit -----
+  # 1 service = 1 GPU reserved. If VRAM is short, adjust model / max-model-len / gpu-memory-utilization.
   thinker:
     image: vllm/vllm-openai:latest
     profiles: ["gpu"]

@@ -1,13 +1,13 @@
 """
-学習コーディネータ骨子 (2/2): sep-CMA-ES で線形ヘッド θ を最適化
+Learned coordinator skeleton (2/2): optimize the linear head theta with sep-CMA-ES
 =============================================================
-J(θ) = E_τ[R(τ)],  R∈{0,1}(タスク成功)。derivative-free。strict budget で rollout 数を制限。
-- 本番 objective: trinity_eval のスコアラーで実rolloutを採点（要: ローカルモデル）
-- selftest(モデル不要): (a)最適化器の収束 (b)コーディネータ配線 (c)ヘッドが学習されること を検証
+J(theta) = E_tau[R(tau)], R in {0,1} (task success). Derivative-free. Caps the rollout count via a strict budget.
+- production objective: score real rollouts with the trinity_eval scorer (needs: local models)
+- selftest (no model): verify (a) the optimizer converges (b) the coordinator wiring (c) the head is learnable
 
-実行:
-  python -m trinity.train --selftest     # モデル不要
-  python -m trinity.train                # 実学習（Qwen3-0.6B + ローカル3モデルが必要）
+Run:
+  python -m trinity.train --selftest     # no model
+  python -m trinity.train                # real training (needs Qwen3-0.6B + 3 local models)
 """
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ from trinity.eval import TASKS, make_scorer
 
 
 # ============================================================
-# 1. separable CMA-ES（対角共分散）
-#    paper の sep-CMA-ES に相当。production では `pip install cma` の
-#    cma.CMAEvolutionStrategy(x0, sigma, {'CMA_diagonal': True}) でも可。
+# 1. separable CMA-ES (diagonal covariance)
+#    Equivalent to the paper's sep-CMA-ES. In production you can also use
+#    cma.CMAEvolutionStrategy(x0, sigma, {'CMA_diagonal': True}) from `pip install cma`.
 # ============================================================
 class SepCMAES:
     def __init__(self, n: int, x0=None, sigma0: float = 0.3, popsize: int | None = None, seed: int = 0):
@@ -33,7 +33,7 @@ class SepCMAES:
         self.rng = np.random.default_rng(seed)
         self.m = np.zeros(n) if x0 is None else np.array(x0, float)
         self.sigma = float(sigma0)
-        self.lam = popsize or (4 + int(3 * np.log(n)))      # λ = 4 + 3 ln n
+        self.lam = popsize or (4 + int(3 * np.log(n)))      # lambda = 4 + 3 ln n
         self.mu = self.lam // 2
         w = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         self.w = w / w.sum()
@@ -43,7 +43,7 @@ class SepCMAES:
         self.cc = (4 + self.mueff / n) / (n + 4 + 2 * self.mueff / n)
         self.c1 = 2 / ((n + 1.3) ** 2 + self.mueff)
         self.cmu = min(1 - self.c1, 2 * (self.mueff - 2 + 1 / self.mueff) / ((n + 2) ** 2 + self.mueff))
-        self.C = np.ones(n)                                 # 対角分散
+        self.C = np.ones(n)                                 # diagonal variance
         self.ps = np.zeros(n)
         self.pc = np.zeros(n)
         self.chiN = np.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n * n))
@@ -55,7 +55,7 @@ class SepCMAES:
         return self.m + self.sigma * self._y
 
     def tell(self, fitnesses) -> None:
-        idx = np.argsort(-np.asarray(fitnesses))[:self.mu]   # 高い報酬ほど良い
+        idx = np.argsort(-np.asarray(fitnesses))[:self.mu]   # higher reward is better
         z, y = self._z[idx], self._y[idx]
         zw, yw = self.w @ z, self.w @ y
         self.m = self.m + self.sigma * yw
@@ -67,13 +67,13 @@ class SepCMAES:
         self.C = ((1 - self.c1 - self.cmu) * self.C
                   + self.c1 * (self.pc ** 2 + (1 - hsig) * self.cc * (2 - self.cc) * self.C)
                   + self.cmu * (self.w @ (y ** 2)))
-        self.C = np.clip(self.C, 1e-12, 1e6)        # 数値安定化(drift/explode防止)
+        self.C = np.clip(self.C, 1e-12, 1e6)        # numerical stabilization (prevent drift/explode)
         self.sigma = float(np.clip(self.sigma, 1e-12, 1e6))
         self.gen += 1
 
 
 # ============================================================
-# 2. objective: θ を実rolloutで採点（J(θ)=平均タスク成功）
+# 2. objective: score theta with real rollouts (J(theta) = mean task success)
 # ============================================================
 def make_rollout_objective(tasks, featurizer, head, pool, max_turns: int = 5):
     scorers = [make_scorer(t) for t in tasks]
@@ -90,13 +90,13 @@ def make_rollout_objective(tasks, featurizer, head, pool, max_turns: int = 5):
 
 
 # ============================================================
-# 3. 学習ループ（strict budget で atomic rollout を上限管理）
+# 3. Training loop (cap atomic rollouts via a strict budget)
 # ============================================================
 def train(objective, n_params: int, n_rollouts_per_eval: int,
           budget: int = 600, sigma0: float = 0.3, m_reps: int = 1,
           seed: int = 0, x0=None, log: bool = True):
-    # 改善余地(Codex): ノイズ下では elite を m_reps↑ で再評価してから tell() すると安定（adaptive reps）。
-    # budgetは generation 単位で判定するため最終世代で多少オーバーシュートし得る。
+    # Room for improvement (Codex): under noise, re-evaluating elites with higher m_reps before tell() is more stable (adaptive reps).
+    # The budget is checked per generation, so the last generation may overshoot a little.
     es = SepCMAES(n_params, x0=x0, sigma0=sigma0, seed=seed)
     spent = 0
     best = (-1.0, None)
@@ -104,7 +104,7 @@ def train(objective, n_params: int, n_rollouts_per_eval: int,
         xs = es.ask()
         fits = []
         for x in xs:
-            f = float(np.mean([objective(x) for _ in range(m_reps)]))   # m_reps回replication(ノイズ平均)
+            f = float(np.mean([objective(x) for _ in range(m_reps)]))   # m_reps replications (noise averaging)
             spent += m_reps * n_rollouts_per_eval
             fits.append(f)
             if f > best[0]:
@@ -116,29 +116,29 @@ def train(objective, n_params: int, n_rollouts_per_eval: int,
 
 
 # ============================================================
-# 4. 本番学習（要: Qwen3-0.6B + ローカル3モデル）
+# 4. Real training (needs: Qwen3-0.6B + 3 local models)
 # ============================================================
 def run_real_training():
     from trinity.config import get
     feat = Qwen3HiddenStateFeaturizer(get("coordinator", "slm_model", "Qwen/Qwen3-0.6B"))   # GPU + transformers
     head = LinearHead(dim=feat.dim)
-    print(f"head params = {head.n_params}  (dim={feat.dim} × {head.n_actions}役割 + bias)")
+    print(f"head params = {head.n_params}  (dim={feat.dim} x {head.n_actions} roles + bias)")
     obj = make_rollout_objective(TASKS, feat, head, POOL)
-    # sep-CMA-ES のハイパラは config.training から（budget/sigma0/m_reps/seed）。
+    # sep-CMA-ES hyperparameters come from config.training (budget/sigma0/m_reps/seed).
     best_f, best_theta = train(obj, head.n_params, n_rollouts_per_eval=len(TASKS),
                                budget=get("training", "budget", 8000),
                                sigma0=get("training", "sigma0", 0.3),
                                m_reps=get("training", "m_reps", 8),
                                seed=get("training", "seed", 0))
     np.save("coordinator_theta.npy", best_theta)
-    print(f"best J(θ)={best_f:.3f}  -> coordinator_theta.npy 保存")
+    print(f"best J(theta)={best_f:.3f}  -> saved coordinator_theta.npy")
 
 
 # ============================================================
-# 5. セルフテスト（モデル不要）
+# 5. Self-test (no model needed)
 # ============================================================
 def selftest():
-    # (a) sep-CMA-ES が既知最適へ収束するか（-||x-3||^2 を最大化）
+    # (a) does sep-CMA-ES converge to a known optimum (maximize -||x-3||^2)
     target = 3.0 * np.ones(8)
     es = SepCMAES(8, sigma0=1.0, seed=1)
     for _ in range(80):
@@ -148,7 +148,7 @@ def selftest():
     assert err < 0.3, f"not converged: {err}"
     print(f"[selftest] sep-CMA-ES converges : ||m-target||={err:.3f}")
 
-    # (b) 配線: LearnedCoordinator + MockFeaturizer + mockモデル で軌跡が回る
+    # (b) wiring: a trajectory runs with LearnedCoordinator + MockFeaturizer + mock models
     from trinity.eval import MockModel
     feat = MockFeaturizer(16)
     head = LinearHead(dim=16)
@@ -157,7 +157,7 @@ def selftest():
 
     def worker_fn(s, u):
         return ("```python\nimport heapq\ndef merge(a,b):\n    return list(heapq.merge(a,b))\n```"
-                if "マージ" in u else "```python\ndef solve():\n    return None\n```")
+                if "merge" in u else "```python\ndef solve():\n    return None\n```")
     pool = {
         "thinker":  MockModel("t", lambda s, u: "plan"),
         "worker":   MockModel("w", worker_fn),
@@ -165,9 +165,9 @@ def selftest():
     }
     res = run(TASKS[0].query, coord, pool, Config(max_turns=5, verbose=False))
     assert res["final"] is not None, "no trajectory produced"
-    print("[selftest] coordinator wiring OK : orchestrate→decide→rollout")
+    print("[selftest] coordinator wiring OK : orchestrate->decide->rollout")
 
-    # (c) 学習が起きる: ヘッドを sep-CMA-ES で目標方策(全状態でWORKER選択)へ整形できる
+    # (c) learning happens: the head can be shaped by sep-CMA-ES toward the target policy (pick WORKER in all states)
     states = [State(query=f"q{i}") for i in range(12)]
     w_idx = ROLE_ACTIONS.index(Role.WORKER)
 

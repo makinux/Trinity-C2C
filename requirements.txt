@@ -1,4 +1,4 @@
-# コア依存（torch は Dockerfile で CPU index から別途導入）
+# Core dependencies (torch is installed separately from the CPU index in the Dockerfile)
 numpy>=1.26
 openai>=1.0
 transformers>=5.0,<6

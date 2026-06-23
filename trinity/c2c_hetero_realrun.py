@@ -1,17 +1,17 @@
 """
-P1 実機: 異種2モデル C2C（SmolLM2-135M → Qwen2.5-0.5B）
+P1 on-device: heterogeneous 2-model C2C (SmolLM2-135M -> Qwen2.5-0.5B)
 =====================================================
-真の異種ペア: SmolLM(層30/KVヘッド3/rope_theta1e5/別トークナイザ) → Qwen(層24/KVヘッド2/rope_theta1e6)。
-これまでの全部品を実機で結線:
-  CharSpanTokenAligner(別トークナイザ) + TorchHeteroRoPEFuser(層/ヘッド/次元吸収 + RoPE-aware)
-  + inv_freq_from_model(各モデルの実RoPEを使用)。
+A true heterogeneous pair: SmolLM (30 layers / 3 KV heads / rope_theta 1e5 / different tokenizer) -> Qwen (24 layers / 2 KV heads / rope_theta 1e6).
+Wire all the prior parts together on real hardware:
+  CharSpanTokenAligner (different tokenizer) + TorchHeteroRoPEFuser (layer/head/dim absorption + RoPE-aware)
+  + inv_freq_from_model (use each model's actual RoPE).
 
-確認:
-  ① sanity : gate=0 の異種注入 == 受信(Qwen)単独 → 異種プラミングが正しい no-op
-  ② gate>0 : 出力が変化 → 2モデル間の注入が結線
-  ③ training: 凍結2モデル越しに勾配が fuser へ貫通し loss が下がる（France(SmolLM)→Japan(Qwen)→Paris）
+Checks:
+  (1) sanity : gate=0 heterogeneous injection == receiver(Qwen) alone -> the heterogeneous plumbing is a correct no-op
+  (2) gate>0 : the output changes -> the cross-model injection is wired up
+  (3) training: gradients flow through the two frozen models into the fuser and the loss drops (France(SmolLM) -> Japan(Qwen) -> Paris)
 
-実行: python -m trinity.c2c_hetero_realrun
+Run: python -m trinity.c2c_hetero_realrun
 """
 import numpy as np
 import torch
@@ -28,8 +28,8 @@ from trinity.c2c_hetero import char_span_align
 from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser
 
 from trinity.config import get
-SHARER = get("c2c", "sharer_model", "HuggingFaceTB/SmolLM2-135M-Instruct")   # Thinker（送信）
-RECVR = get("c2c", "receiver_model", "Qwen/Qwen2.5-0.5B-Instruct")            # Worker（受信）
+SHARER = get("c2c", "sharer_model", "HuggingFaceTB/SmolLM2-135M-Instruct")   # Thinker (sharer)
+RECVR = get("c2c", "receiver_model", "Qwen/Qwen2.5-0.5B-Instruct")            # Worker (receiver)
 
 
 def load(name):
@@ -55,10 +55,10 @@ def encode(m, tok, text):
 
 
 def main():
-    print(f"[load] sharer={SHARER} / receiver={RECVR} (CPU, frozen) …")
+    print(f"[load] sharer={SHARER} / receiver={RECVR} (CPU, frozen) ...")
     sm, stok, s_inv, s_shape = load(SHARER)
     qm, qtok, q_inv, q_shape = load(RECVR)
-    print(f"[shapes] sharer {s_shape}  →  receiver {q_shape}   （層/KVヘッド/base すべて異種）")
+    print(f"[shapes] sharer {s_shape}  ->  receiver {q_shape}   (layers / KV heads / base all heterogeneous)")
 
     fuser = TorchHeteroRoPEFuser(s_shape, q_shape, s_inv, q_inv, init_gate=0.05)
 
@@ -77,12 +77,12 @@ def main():
     def fuse_for(sharer_text, recv_text):
         sK, sV, s_ids, s_off = encode(sm, stok, sharer_text)
         rK, rV, r_ids, r_off = encode(qm, qtok, recv_text)
-        gidx = char_span_align(r_off, s_off)                       # 受信(Qwen)位置 → 送信(SmolLM)位置
+        gidx = char_span_align(r_off, s_off)                       # receiver(Qwen) position -> sharer(SmolLM) position
         recv_layers = [(rK[l], rV[l]) for l in range(q_shape.n_layers)]
         sp, rp = list(range(s_ids.shape[1])), list(range(r_ids.shape[1]))
         return recv_layers, sK, sV, sp, gidx, rp, r_ids
 
-    # ① sanity: 同一テキスト・gate=0 → 受信単独と一致（異種プラミングが no-op）
+    # (1) sanity: same text, gate=0 -> matches receiver-alone (the heterogeneous plumbing is a no-op)
     text = "Country: France. The capital city is"
     recv_layers, sK, sV, sp, gidx, rp, r_ids = fuse_for(text, text)
     targets = [" Paris", " Lyon"]
@@ -90,17 +90,17 @@ def main():
     with torch.no_grad():
         standalone = torch.log_softmax(qm(input_ids=r_ids).logits[0, -1].float(), -1)
         std = {t: float(standalone[qtok(t, add_special_tokens=False)["input_ids"][0]]) for t in targets}
-        fuser.gate_logit.data.fill_(-50.0)                          # gate≈0
+        fuser.gate_logit.data.fill_(-50.0)                          # gate~0
         g0 = recv_cont_logp(recv_layers, r_ids, fuser.fuse(recv_layers, sK, sV, sp, gidx, rp), targets)
-        fuser.gate_logit.data.fill_(2.0)                            # gate≈0.88（未学習Wでの効果確認）
+        fuser.gate_logit.data.fill_(2.0)                            # gate~0.88 (check the effect with untrained W)
         gp = recv_cont_logp(recv_layers, r_ids, fuser.fuse(recv_layers, sK, sV, sp, gidx, rp), targets)
     ok = abs(std[" Paris"] - g0[" Paris"]) < 1e-2
     print(f"[sanity] standalone Paris={std[' Paris']:.2f} / gate0-inj Paris={g0[' Paris']:.2f}  "
-          f"{'✓ no-op一致(異種プラミング正しい)' if ok else '✗不一致'}")
-    print(f"[gate>0] 未学習Wでの注入で出力変化: Paris {g0[' Paris']:.2f} → {gp[' Paris']:.2f}（結線確認・意味は学習後）")
+          f"{'OK no-op match (heterogeneous plumbing correct)' if ok else 'X mismatch'}")
+    print(f"[gate>0] injection with untrained W changes the output: Paris {g0[' Paris']:.2f} -> {gp[' Paris']:.2f} (wiring confirmed; meaning comes after training)")
 
-    # ③ cross-model training: SmolLM(France) → Qwen(Japan) → ' Paris'
-    print("[train] SmolLM(France文脈) を Qwen(Japan文脈) に融合し ' Paris' を予測するよう学習")
+    # (3) cross-model training: SmolLM(France) -> Qwen(Japan) -> ' Paris'
+    print("[train] fuse SmolLM(France context) into Qwen(Japan context) and train to predict ' Paris'")
     rl, sK2, sV2, sp2, gidx2, rp2, r_ids2 = fuse_for("Country: France. The capital city is",
                                                      "Country: Japan. The capital city is")
     pid = qtok(" Paris", add_special_tokens=False)["input_ids"][0]
@@ -119,10 +119,10 @@ def main():
         loss = -torch.log_softmax(out.logits[0, -1].float(), -1)[pid]
         loss.backward()
         if step == 0:
-            assert fuser.Wk["0"].grad is not None and torch.isfinite(fuser.gate_logit.grad).all(), "勾配が2モデル越しに届かない"
+            assert fuser.Wk["0"].grad is not None and torch.isfinite(fuser.gate_logit.grad).all(), "gradients do not reach through the two models"
         opt.step()
         print(f"  step {step} | -logp(Paris)={loss.item():.3f}")
-    print("→ 凍結した『別アーキ2モデル』越しに勾配が fuser へ貫通し学習が進む＝異種C2Cの実機結線を実証。")
+    print("-> gradients flow through the two frozen, different-architecture models into the fuser and training proceeds = demonstrates the on-device wiring of heterogeneous C2C.")
 
 
 if __name__ == "__main__":

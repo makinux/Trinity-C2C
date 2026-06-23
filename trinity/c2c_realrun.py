@@ -1,21 +1,21 @@
 """
-P1(a) 実機: SLM で C2C 転移シグナルを確認する
+P1(a) on-device: confirm the C2C transfer signal with an SLM
 =============================================
-self-C2C: recv='Japan文脈' に share='France文脈' の KVを融合し、次トークンの
-Δlogp(' Paris') / Δlogp(' Tokyo') を gate 別に測る。gate↑で ΔParis>0 & ΔTokyo<0 なら転移あり。
+self-C2C: fuse share='France context' KV into recv='Japan context' and measure the next token's
+delta-logp(' Paris') / delta-logp(' Tokyo') per gate. If, as the gate rises, dParis>0 & dTokyo<0, there is transfer.
 
-堅実化:
-  - 継続は「文脈KVの末尾1トークンをライブ入力、残り(L-1)を fused past」で計算（KVキャッシュの教科書動作）。
-    → gate=0 は通常 forward と一致するはず（サニティで確認）。
-  - 社内SSL: truststore で OS 証明書ストアを使い HF ダウンロードを通す。
+Robustness:
+  - The continuation is computed as "the last 1 token of the context KV as live input, the remaining (L-1) as the fused past" (textbook KV-cache behavior).
+    -> gate=0 should match a normal forward pass (confirmed by a sanity check).
+  - Corporate SSL: use the OS certificate store via truststore to get HF downloads through.
 
-実行: python -m trinity.c2c_realrun        （環境変数 C2C_MODEL でモデル変更可）
+Run: python -m trinity.c2c_realrun        (the C2C_MODEL env var can change the model)
 """
 import os
 import numpy as np
 
 try:
-    import truststore; truststore.inject_into_ssl()   # 社内SSL検査環境対策
+    import truststore; truststore.inject_into_ssl()   # workaround for corporate SSL-inspection environments
 except Exception as e:
     print("[warn] truststore unavailable:", e)
 
@@ -33,13 +33,13 @@ def kv_slice(kv: KVCache, upto: int) -> KVCache:
 
 
 def extract_kv(pkv) -> KVCache:
-    """transformers 5.x DynamicCache → KVCache（batch次元を落とす）。"""
+    """transformers 5.x DynamicCache -> KVCache (drop the batch dim)."""
     return KVCache([(lyr.keys.detach().cpu().numpy()[0], lyr.values.detach().cpu().numpy()[0])
                     for lyr in pkv.layers])
 
 
 def build_cache(kv: KVCache) -> DynamicCache:
-    """KVCache → transformers 5.x DynamicCache（update()で各層を投入。from_legacy_cacheは廃止済）。"""
+    """KVCache -> transformers 5.x DynamicCache (feed each layer via update(); from_legacy_cache is removed)."""
     c = DynamicCache()
     for i, (K, V) in enumerate(kv.layers):
         c.update(torch.tensor(K, dtype=torch.float32).unsqueeze(0),
@@ -48,7 +48,7 @@ def build_cache(kv: KVCache) -> DynamicCache:
 
 
 def main():
-    print(f"[load] {MODEL} (CPU, eager) …")
+    print(f"[load] {MODEL} (CPU, eager) ...")
     tok = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, torch_dtype=torch.float32, attn_implementation="eager").eval()
@@ -58,7 +58,7 @@ def main():
     shape = KVShape(cfg.num_hidden_layers, n_kv, head_dim)
     print(f"[load] KV shape = {shape}")
 
-    def tid(s):  # ターゲット先頭トークンID
+    def tid(s):  # target's first token ID
         return tok(s, add_special_tokens=False)["input_ids"][0]
 
     def encode(text):
@@ -68,7 +68,7 @@ def main():
         return extract_kv(out.past_key_values), ids[0].tolist()
 
     def cont_logprobs(fused_full: KVCache, last_token_id: int, targets):
-        """fused(長さL) の末尾を落として past=(L-1)、last_token をライブ入力 → 次トークンlogp。"""
+        """Drop the tail of fused (length L) so past=(L-1), feed last_token live -> next-token logp."""
         L = fused_full.layers[0][0].shape[1]
         cache = build_cache(kv_slice(fused_full, L - 1))
         inp = torch.tensor([[last_token_id]])
@@ -87,11 +87,11 @@ def main():
     recv_kv, recv_ids = encode(recv_ctx)
     share_kv, share_ids = encode(share_ctx)
     print(f"[ctx] len(recv)={len(recv_ids)} len(share)={len(share_ids)} "
-          f"({'等長OK' if len(recv_ids)==len(share_ids) else '⚠️非等長(位置整合崩れ)'})")
+          f"({'equal-length OK' if len(recv_ids)==len(share_ids) else '[!] not equal length (position alignment broken)'})")
     share_kv = IdentityTokenAligner().align(share_kv, share_ids, recv_ids)
     fuser = C2CFuser.init(shape, shape, seed=0)
 
-    # --- sanity: gate=0 注入 == 通常forward の次トークン分布 ---
+    # --- sanity: gate=0 injection == normal forward's next-token distribution ---
     with torch.no_grad():
         ln = torch.log_softmax(model(input_ids=torch.tensor([recv_ids])).logits[0, -1].float(), dim=-1)
     normal = {t: float(ln[tid(t)]) for t in targets}
@@ -100,10 +100,10 @@ def main():
     ok = all(abs(normal[t] - inj0[t]) < 1e-2 for t in targets)
     print(f"[sanity] normal={{P:{normal[' Paris']:.2f},T:{normal[' Tokyo']:.2f}}} "
           f"gate0-inj={{P:{inj0[' Paris']:.2f},T:{inj0[' Tokyo']:.2f}}}  "
-          f"{'✓一致(KV注入が正しい)' if ok else '✗不一致→注入経路の不整合'}")
+          f"{'OK match (KV injection is correct)' if ok else 'X mismatch -> injection-path inconsistency'}")
 
     # --- transfer sweep ---
-    print("[transfer] recv=Japan文脈 に France文脈KVを注入:")
+    print("[transfer] inject France-context KV into recv=Japan-context:")
     base = None
     for g in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
         fuser.set_gate(g)
@@ -112,8 +112,8 @@ def main():
             base = lp
         dP, dT = lp[" Paris"] - base[" Paris"], lp[" Tokyo"] - base[" Tokyo"]
         print(f"  gate={g:<4} logp(Paris)={lp[' Paris']:6.2f} logp(Tokyo)={lp[' Tokyo']:6.2f} "
-              f"| ΔParis={dP:+.2f} ΔTokyo={dT:+.2f}")
-    print("\n判定: gate↑で ΔParis>0 かつ ΔTokyo<0 なら『C2C転移シグナルあり』。")
+              f"| dParis={dP:+.2f} dTokyo={dT:+.2f}")
+    print("\nVerdict: if dParis>0 and dTokyo<0 as the gate rises, there is a 'C2C transfer signal'.")
 
 
 if __name__ == "__main__":

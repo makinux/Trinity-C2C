@@ -1,17 +1,17 @@
 """
-P0 評価ハーネス（実スコアラー）＋ 学習コーディネータ統合
+P0 evaluation harness (real scorer) + learned-coordinator integration
 =======================================================
-- スコアラー: 生成物からコード抽出 → 隔離サブプロセスで単体テスト実行 → 合否（決定的・外部採点）
-- 比較: Trinity(P0 scripted) / Trinity(learned) / Worker×5自己改善 / 各モデル1-shot
-  ※ Trinity系 と Worker×5 は計算量を揃えた公平比較。1-shotは参考値。
+- scorer: extract code from the output -> run unit tests in an isolated subprocess -> pass/fail (deterministic, external scoring)
+- comparison: Trinity(P0 scripted) / Trinity(learned) / Worker x5 self-refine / each model 1-shot
+  Note: the Trinity variants and Worker x5 are a compute-matched fair comparison. 1-shot is a reference value.
 
-実行:
-  python -m trinity.eval --selftest                              # モデル不要。配線検証
-  python -m trinity.eval --trials 3                              # 4方策のベースライン
-  python -m trinity.eval --trials 3 --learned coordinator_theta.npy   # 学習版も列に追加(qwen3特徴量)
-  python -m trinity.eval --learned theta.npy --featurizer mock   # mock特徴量で学習版を載せる
+Run:
+  python -m trinity.eval --selftest                              # no model. wiring check
+  python -m trinity.eval --trials 3                              # baseline of 4 policies
+  python -m trinity.eval --trials 3 --learned coordinator_theta.npy   # also add the learned column (qwen3 features)
+  python -m trinity.eval --learned theta.npy --featurizer mock   # load the learned version with mock features
 
-⚠️ セキュリティ: 生成コードを実行する。-I/-S・timeout・一時cwd・最小envで隔離するが「真のサンドボックスではない」。
+[!] Security: this runs generated code. It isolates with -I/-S, timeout, a temp cwd, and a minimal env, but is "not a true sandbox".
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from trinity.config import get
 
 
 # ============================================================
-# 1. コーディングタスク（最小ベンチ）
+# 1. Coding tasks (a minimal bench)
 # ============================================================
 @dataclass
 class CodingTask:
@@ -45,7 +45,7 @@ class CodingTask:
 TASKS: list[CodingTask] = [
     CodingTask(
         "merge_sorted",
-        "2つのソート済み整数リストを受け取り、ソート済みにマージした新リストを返す関数 `merge(a, b)` を Python で書け。",
+        "Write a Python function `merge(a, b)` that takes two sorted integer lists and returns a new list merged in sorted order.",
         textwrap.dedent("""
             assert merge([1,3,5],[2,4,6]) == [1,2,3,4,5,6]
             assert merge([], [1]) == [1]
@@ -54,7 +54,7 @@ TASKS: list[CodingTask] = [
     ),
     CodingTask(
         "two_sum",
-        "整数リスト nums と target を受け取り、和が target になる2要素のインデックス対を返す関数 `two_sum(nums, target)` を書け。",
+        "Write a function `two_sum(nums, target)` that takes an integer list `nums` and a `target`, and returns the index pair of the two elements whose sum equals `target`.",
         textwrap.dedent("""
             assert sorted(two_sum([2,7,11,15],9)) == [0,1]
             assert sorted(two_sum([3,2,4],6)) == [1,2]
@@ -62,7 +62,7 @@ TASKS: list[CodingTask] = [
     ),
     CodingTask(
         "is_palindrome",
-        "文字列を英数字のみ・大文字小文字無視で回文判定する関数 `is_palindrome(s)` を書け。",
+        "Write a function `is_palindrome(s)` that decides whether a string is a palindrome, considering only alphanumeric characters and ignoring case.",
         textwrap.dedent("""
             assert is_palindrome("A man, a plan, a canal: Panama") is True
             assert is_palindrome("race a car") is False
@@ -70,7 +70,7 @@ TASKS: list[CodingTask] = [
     ),
     CodingTask(
         "fib",
-        "n番目のフィボナッチ数 (F(0)=0, F(1)=1) を返す関数 `fib(n)` を書け。",
+        "Write a function `fib(n)` that returns the n-th Fibonacci number (F(0)=0, F(1)=1).",
         textwrap.dedent("""
             assert fib(0) == 0 and fib(1) == 1
             assert fib(10) == 55
@@ -80,7 +80,7 @@ TASKS: list[CodingTask] = [
 
 
 # ============================================================
-# 2. コード抽出 + 実行スコアラー
+# 2. Code extraction + execution scorer
 # ============================================================
 def extract_code(text: str) -> str:
     blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, flags=re.S | re.I)
@@ -118,10 +118,10 @@ def make_scorer(task: CodingTask, timeout: float | None = None) -> Callable[[str
 
 
 # ============================================================
-# 3. 方策（generator factory）。pool を注入可能（テスト用にmock差し替え）
+# 3. Policies (generator factory). pool is injectable (swap in a mock for tests)
 # ============================================================
 def gen_with_coordinator(coordinator: Coordinator, pool: dict = POOL) -> Callable[[CodingTask], str]:
-    """任意の Coordinator（Scripted / Learned）で Trinity を回す方策。"""
+    """A policy that runs Trinity with any Coordinator (Scripted / Learned)."""
     def gen(task: CodingTask) -> str:
         return run(task.query, coordinator, pool, Config(verbose=False))["final"] or ""
     return gen
@@ -137,15 +137,15 @@ def gen_single(model_key: str, pool: dict = POOL) -> Callable[[CodingTask], str]
 
 
 def gen_worker_self_refine(turns: int = 5, pool: dict = POOL) -> Callable[[CodingTask], str]:
-    """Worker×N自己改善（計算量をTrinityと同等にした公平ベースライン。テストは覗かない）。"""
+    """Worker xN self-refinement (a fair baseline compute-matched to Trinity; it does not peek at the tests)."""
     def gen(task: CodingTask) -> str:
         try:
-            ans = pool["worker"].chat(SYS[Role.WORKER], f"[QUERY]\n{task.query}\n\n[TASK] 完全な解（コード）を書け。")
+            ans = pool["worker"].chat(SYS[Role.WORKER], f"[QUERY]\n{task.query}\n\n[TASK] Write the complete solution (code).")
             for _ in range(max(turns - 1, 0)):
                 ans = pool["worker"].chat(
                     SYS[Role.WORKER],
-                    f"[QUERY]\n{task.query}\n\n[現在の解]\n{ans}\n\n"
-                    f"[TASK] 自分の解の誤り・抜けを批判的に点検し、必要なら改善した完全な解を出せ。問題なければ同じ解を再掲。",
+                    f"[QUERY]\n{task.query}\n\n[Current solution]\n{ans}\n\n"
+                    f"[TASK] Critically check your solution for errors/omissions and, if needed, output an improved complete solution. If it is fine, restate the same solution.",
                 )
             return ans
         except Exception as e:
@@ -154,7 +154,7 @@ def gen_worker_self_refine(turns: int = 5, pool: dict = POOL) -> Callable[[Codin
 
 
 # ============================================================
-# 4. 学習済みコーディネータのロード（θ → LearnedCoordinator）
+# 4. Load a learned coordinator (theta -> LearnedCoordinator)
 # ============================================================
 def build_learned_coordinator(theta_path: str, featurizer_kind: str = "qwen3") -> Coordinator:
     import numpy as np
@@ -163,7 +163,7 @@ def build_learned_coordinator(theta_path: str, featurizer_kind: str = "qwen3") -
     )
     theta = np.load(theta_path)
     if featurizer_kind == "mock":
-        dim = (len(theta) - 3) // 3                 # n_params = dim*3 + 3 から逆算
+        dim = (len(theta) - 3) // 3                 # back out from n_params = dim*3 + 3
         feat = MockFeaturizer(dim)
     else:
         feat = Qwen3HiddenStateFeaturizer()         # GPU + transformers
@@ -173,21 +173,21 @@ def build_learned_coordinator(theta_path: str, featurizer_kind: str = "qwen3") -
 
 
 # ============================================================
-# 5. ベンチ実行（4方策＋任意の追加方策＝学習版）
+# 5. Run the bench (4 policies + an optional extra policy = the learned version)
 # ============================================================
 def bench(tasks: list[CodingTask] = TASKS, trials: int = 1, pool: dict = POOL,
           extra_policies: Optional[dict[str, Callable[[CodingTask], str]]] = None) -> dict[str, float]:
     policies: dict[str, Callable[[CodingTask], str]] = {
-        "Trinity(P0)":       gen_with_coordinator(ScriptedCoordinator(), pool),  # 最大5呼び出し
-        "Worker x5 selfref": gen_worker_self_refine(5, pool),                    # 5呼び出し(公平)
-        "Worker 1-shot":     gen_single("worker", pool),                         # 参考
-        "Thinker 1-shot":    gen_single("thinker", pool),                        # 参考
-        "Verifier 1-shot":   gen_single("verifier", pool),                       # 参考
+        "Trinity(P0)":       gen_with_coordinator(ScriptedCoordinator(), pool),  # up to 5 calls
+        "Worker x5 selfref": gen_worker_self_refine(5, pool),                    # 5 calls (fair)
+        "Worker 1-shot":     gen_single("worker", pool),                         # reference
+        "Thinker 1-shot":    gen_single("thinker", pool),                        # reference
+        "Verifier 1-shot":   gen_single("verifier", pool),                       # reference
     }
     if extra_policies:
-        policies.update(extra_policies)             # 例: {"Trinity(learned)": gen_with_coordinator(learned, pool)}
+        policies.update(extra_policies)             # e.g. {"Trinity(learned)": gen_with_coordinator(learned, pool)}
 
-    print(f"\n[pass@1 over {trials} seed(s)]  ※ Trinity系/Worker×5は計算量同等。1-shotは参考。")
+    print(f"\n[pass@1 over {trials} seed(s)]  Note: Trinity variants / Worker x5 are compute-matched. 1-shot is a reference.")
     print(f"{'policy':<19}" + "".join(f"{t.name:<14}" for t in tasks) + "mean")
     print("-" * (19 + 14 * len(tasks) + 6))
     results: dict[str, float] = {}
@@ -204,7 +204,7 @@ def bench(tasks: list[CodingTask] = TASKS, trials: int = 1, pool: dict = POOL,
 
 
 # ============================================================
-# 6. セルフテスト（モデル不要）
+# 6. Self-test (no model needed)
 # ============================================================
 class MockModel:
     def __init__(self, name: str, fn: Callable[[str, str], str]):
@@ -218,7 +218,7 @@ class MockModel:
 def _mock_pool() -> dict:
     def worker_fn(s, u):
         return ("```python\nimport heapq\ndef merge(a,b):\n    return list(heapq.merge(a,b))\n```"
-                if "マージ" in u else "```python\ndef solve():\n    return None\n```")
+                if "merge" in u else "```python\ndef solve():\n    return None\n```")
     return {
         "thinker":  MockModel("t", lambda s, u: "plan"),
         "worker":   MockModel("w", worker_fn),
@@ -242,7 +242,7 @@ def selftest() -> None:
     assert res["accepted"] is True and make_scorer(TASKS[0])(res["final"]) is True
     print("[selftest] pipeline OK : orchestrate->extract->exec->score")
 
-    # 学習版を bench に統合できること（mock特徴量＋mockモデル）
+    # the learned version can be integrated into the bench (mock features + mock model)
     import numpy as np
     from trinity.coordinator import MockFeaturizer, LinearHead, LearnedCoordinator
     feat = MockFeaturizer(16)
@@ -251,7 +251,7 @@ def selftest() -> None:
     table = bench(tasks=TASKS[:1], trials=1, pool=mock,
                   extra_policies={"Trinity(learned)": gen_with_coordinator(learned, mock)})
     assert "Trinity(learned)" in table and isinstance(table["Trinity(learned)"], float)
-    print("[selftest] learned-in-bench OK : 学習版を比較表に統合")
+    print("[selftest] learned-in-bench OK : learned version integrated into the comparison table")
     print("[selftest] ALL PASSED")
 
 
@@ -262,7 +262,7 @@ if __name__ == "__main__":
     else:
         trials = int(sys.argv[sys.argv.index("--trials") + 1]) if "--trials" in sys.argv else get("eval", "trials", 1)
         tasks = TASKS
-        if "--dataset" in sys.argv:                 # HumanEval+/MBPP+ を使う
+        if "--dataset" in sys.argv:                 # use HumanEval+/MBPP+
             ds = sys.argv[sys.argv.index("--dataset") + 1]
             limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 20
             from trinity.datasets import load_humaneval_plus, load_mbpp_plus

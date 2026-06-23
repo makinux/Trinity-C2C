@@ -1,12 +1,12 @@
 # ============================================================
-# Trinity / C2C ローカル構成（config.yml）
-#   環境変数 TRINITY_CONFIG で別パス指定可。未指定なら ./config.yml。
-#   ファイルや pyyaml が無い場合は trinity_config.py の DEFAULTS で動作。
-#   *_URL 環境変数 (THINKER_URL/WORKER_URL/VERIFIER_URL) は base_url を上書き。
-#   秘密鍵は <ROLE>_API_KEY (例 WORKER_API_KEY) を env で渡すのが推奨（YAML平文を避ける）。
+# Trinity / C2C local configuration (config.yml)
+#   The TRINITY_CONFIG env var can point to a different path. Defaults to ./config.yml.
+#   If the file or pyyaml is missing, the DEFAULTS in trinity_config.py are used.
+#   *_URL env vars (THINKER_URL/WORKER_URL/VERIFIER_URL) override base_url.
+#   Secrets are best passed via <ROLE>_API_KEY (e.g. WORKER_API_KEY) in the env (avoid plaintext YAML).
 # ============================================================
 
-# 役割ごとのモデル（OpenAI互換ローカルエンドポイント）
+# Per-role models (OpenAI-compatible local endpoints)
 models:
   thinker:
     name: GLM
@@ -15,7 +15,7 @@ models:
     api_key: EMPTY
     temperature: 0.6
     max_tokens: 4096
-    # system_prompt: （省略時は prompts.thinker を使用）
+    # system_prompt: (when omitted, prompts.thinker is used)
   worker:
     name: Qwen3-Coder
     base_url: http://localhost:8002/v1
@@ -31,37 +31,37 @@ models:
     temperature: 0.6
     max_tokens: 4096
 
-# 役割別システムプロンプト（models.<role>.system_prompt があればそちら優先）
+# Per-role system prompts (models.<role>.system_prompt takes precedence if present)
 prompts:
-  thinker: "あなたはThinker。問題を分析し、高レベルの計画・分解・既存解への批評のみを返す。コードや最終解は書かない。"
-  worker: "あなたはWorker。これまでの計画と批評を踏まえ、最終解（完全なコード/導出/数値）を具体的に作る。"
-  verifier: "あなたはVerifier。最新のWorker成果物がクエリを正しく・完全に満たすか点検する。最終行に必ず 'VERDICT: ACCEPT' か 'VERDICT: REVISE' を出力。REVISEなら具体的修正点も述べる。"
+  thinker: "You are the Thinker. Analyze the problem and return only high-level plans, decompositions, and critiques of existing solutions. Do not write code or the final solution."
+  worker: "You are the Worker. Building on the plans and critiques so far, produce the concrete final solution (complete code/derivation/numbers)."
+  verifier: "You are the Verifier. Check whether the latest Worker artifact correctly and completely satisfies the query. Always output 'VERDICT: ACCEPT' or 'VERDICT: REVISE' on the last line. If REVISE, also state the specific fixes."
 
-# オーケストレーション
+# Orchestration
 orchestration:
   max_turns: 5
   verbose: true
 
-# コーディネータ（学習）
+# Coordinator (learned)
 coordinator:
-  slm_model: Qwen/Qwen3-0.6B      # 特徴量を出す小型SLM
+  slm_model: Qwen/Qwen3-0.6B      # small SLM that produces the features
   featurizer: qwen3               # qwen3 | mock
-  mask_no_artifact: true          # 成果物前のVerifyを禁止
+  mask_no_artifact: true          # forbid Verify before an artifact exists
 
-# sep-CMA-ES 学習
+# sep-CMA-ES training
 training:
   budget: 8000
   sigma0: 0.3
   m_reps: 8
   seed: 0
 
-# 評価ハーネス
+# Evaluation harness
 eval:
   trials: 1
   timeout: 10.0
-  max_inputs: null                # null=全入力(EvalPlus忠実)。数値指定で上限
+  max_inputs: null                # null = all inputs (EvalPlus-faithful). A number sets an upper bound.
 
-# C2C（潜在融合）
+# C2C (latent fusion)
 c2c:
   sharer_model: HuggingFaceTB/SmolLM2-135M-Instruct
   receiver_model: Qwen/Qwen2.5-0.5B-Instruct

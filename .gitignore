@@ -6,17 +6,17 @@ __pycache__/
 venv/
 .env
 
-# 学習成果物 / 実行ログ
+# Training artifacts / run logs
 coordinator_theta.npy
 *.output
 *.npy
 
-# OS / エディタ
+# OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 
-# HuggingFace キャッシュ（誤コミット防止）
+# HuggingFace cache (avoid accidental commits)
 .cache/
 hf-cache/

@@ -1,11 +1,11 @@
-# ローカル版 Trinity-C2C アーキテクチャ設計書
+# Local Trinity-C2C architecture design doc
 
-- 作成日: 2026-06-23
-- 前提: ローカル/オープンモデルのみ（Qwen, GLM, DeepSeek など）。クローズドなクラウドAIサービスは使用しない。
-- 通信層: Cache-to-Cache (C2C) によるモデル間KV潜在融合を中核に据える。
-- 検討経緯: Claude と Codex (gpt-5.5) の共同レビューにより、当初の chain 型から **star 型** に変更。
+- Created: 2026-06-23
+- Premise: local/open models only (Qwen, GLM, DeepSeek, etc.). No closed cloud AI services.
+- Communication layer: built around inter-model KV latent fusion via Cache-to-Cache (C2C).
+- Background: through a joint review by Claude and Codex (gpt-5.5), the topology changed from the original chain type to a **star type**.
 
-## 参照論文
+## Reference papers
 - Trinity: An Evolved LLM Coordinator — arXiv:2512.04695
 - Cache-to-Cache (C2C): Direct Semantic Communication Between LLMs — arXiv:2510.03215
 - Activated LoRA (aLoRA) — arXiv:2504.12397
@@ -13,131 +13,135 @@
 
 ---
 
-## 0. 設計の狙い
-- 一貫性（解釈ドリフトの抑制） + 低コスト + 誤りの非相関（多様性）を、ローカルのみで両立する。
-- モデル間通信を「損失の多いテキスト」から「より豊かな潜在(KV)」へ置き換える（=C2C）。
-- ただしC2Cの弱点（ペアワイズ・一方向・履歴分岐に弱い・両モデルprefillが必要）を設計で回避する。
+## 0. Design goals
+- Achieve consistency (suppressing interpretation drift) + low cost + error decorrelation (diversity), all locally.
+- Replace inter-model communication from "lossy text" with "richer latents (KV)" (= C2C).
+- But work around C2C's weaknesses by design (pairwise, one-directional, fragile to history divergence, needs prefill of both models).
 
 ---
 
-## 1. トポロジー（star 型）
+## 1. Topology (star type)
 
 ```
                          ┌───────────────────────────────┐
         Query Q ───────► │  Coordinator (router)         │
                          │  Qwen3-0.6B + head            │
-                         │  学習: sep-CMA-ES（終端報酬）  │
+                         │  train: sep-CMA-ES            │
+                         │  (terminal reward)            │
                          └──────┬─────────┬─────────┬─────┘
-              （制御: 点線。全役割をルーティング）       ┊
+              (control: dotted lines; routes all roles)
                   ┊            ┊                       ┊
                   ▼            ▼                       ▼
-        ┌───────────────┐   ┌───────────────────┐   ┌────────────────────┐
-        │ Thinker       │   │ Worker = Receiver ★│   │ Verifier           │
-        │ GLM           │──►│ Qwen3-Coder        │◄──│ DeepSeek-R1-distill │
-        │ 計画/分解/批評 │   │ 唯一の中心統合点    │   │ 検証 ACCEPT/REVISE  │
-        └───────────────┘   └─────────┬──────────┘   └────────────────────┘
-           plan(潜在/C2C) ─┘          │   └─ critique(潜在/C2C, REVISE)
-                                       │      artifact(テキスト) ─►Verifier
-                                       ▼
-                               ┌──────────────┐
-                               │ Final artifact│  ← Verifier が ACCEPT で確定
-                               └──────────────┘
+        ┌────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+        │ Thinker        │  │ Worker = Receiver ★ │  │ Verifier            │
+        │ GLM            │─►│ Qwen3-Coder         │◄─│ DeepSeek-R1-distill │
+        │ plan/decompose │  │ the single central  │  │ verify              │
+        │ /critique      │  │ integration point   │  │ ACCEPT/REVISE       │
+        └────────────────┘  └──────────┬──────────┘  └─────────────────────┘
+           plan (latent/C2C) ┘         │   └─ critique (latent/C2C, REVISE)
+                                        │      artifact (text) ─► Verifier
+                                        ▼
+                                ┌────────────────┐
+                                │ Final artifact │  ◄ finalized when Verifier = ACCEPT
+                                └────────────────┘
 ```
 
-凡例:
-- 実線(C2C latent bus): ソフトな意図・計画・批評・不確実性を潜在(KV)で運ぶ
-- 破線(exact text/artifact): コード・証明・成果物など「正確さが必要な現物」をテキストで運ぶ
-- 点線(coordinator control): Coordinator が各役割の起動順・ループ・停止を制御
+Legend:
+- solid line (C2C latent bus): carries soft intent / plan / critique / uncertainty as latents (KV)
+- dashed line (exact text/artifact): carries the "things that must be exact" (code, proofs, artifacts) as text
+- dotted line (coordinator control): the Coordinator controls each role's invocation order, looping, and stopping
 
 ---
 
-## 2. 構成要素とモデル割当（誤りの非相関を最大化）
+## 2. Components and model assignment (maximize error decorrelation)
 
-| 構成要素 | モデル | 役割 / 理由 |
+| Component | Model | Role / rationale |
 |---|---|---|
-| Coordinator（ルーター） | Qwen3-0.6B + 約1万paramヘッド | 流れの制御のみ。sep-CMA-ESで終端報酬から学習。Trinityの「激安コーディネート」を継承 |
-| Thinker（Sharer） | GLM | 計画・分解・批評。Qwen系と異なる帰納バイアス |
-| Worker = Receiver ★（中心） | Qwen3-Coder | 唯一の統合点。成果物を生成。最強のローカルコード生成＝安定した融合先 |
-| Verifier（Sharer） | DeepSeek-R1-distill | 検証＋ACCEPT/REVISE。WorkerともThinkerとも別系統＝最大の誤り非相関 |
+| Coordinator (router) | Qwen3-0.6B + ~10K-param head | Flow control only. Learns from terminal reward via sep-CMA-ES. Inherits Trinity's "dirt-cheap coordination" |
+| Thinker (Sharer) | GLM | Plan / decompose / critique. Inductive bias different from the Qwen family |
+| Worker = Receiver ★ (center) | Qwen3-Coder | The single integration point. Generates the artifact. Strongest local code generation = a stable fusion target |
+| Verifier (Sharer) | DeepSeek-R1-distill | Verification + ACCEPT/REVISE. A different lineage from both Worker and Thinker = maximal error decorrelation |
 
-注: GLMをThinkerとVerifierの両方に使わないこと（非相関が崩れる）。
-
----
-
-## 3. なぜ star か（chain を捨てた理由）
-C2Cはペアワイズ・一方向・履歴分岐に弱い。Thinker→Worker→Verifier→Worker と潜在状態を鎖状に渡すと
-分布シフトが累積する（"latent telephone" = 伝言ゲーム化）。
-→ 中心のReceiver（Qwen3-Coder）を唯一の正準統合点にし、Sharerはそこへ放射状に潜在を注入。
-
-学習が必要な fuser は2本だけ:
-- GLM(Thinker) → Qwen3-Coder(Receiver)   … 計画の潜在
-- DeepSeek(Verifier) → Qwen3-Coder(Receiver) … 批評の潜在
-
-Worker→Verifier 方向は fuser 不要。成果物は「正確なテキスト」で渡せば足りる。
+Note: do not use GLM for both Thinker and Verifier (it breaks decorrelation).
 
 ---
 
-## 4. 二重チャネル（latent + exact text）
-- 潜在チャネル(C2C): ソフトな意図・計画事前分布・批評・不確実性 → Receiverへ融合
-- 正確チャネル(テキスト): コード・証明・成果物（ロスのある融合に載せてはいけないもの）
+## 3. Why star (why we dropped chain)
+C2C is pairwise, one-directional, and fragile to history divergence. Passing latent state in a
+chain Thinker->Worker->Verifier->Worker accumulates distribution shift ("latent telephone").
+-> Make the central Receiver (Qwen3-Coder) the single canonical integration point, and have the
+Sharers inject latents into it radially.
 
-原則: 「意図は潜在で、現物はテキストで」運ぶ。純粋な潜在ハンドオフに固執しない。
+Only two fusers need training:
+- GLM (Thinker) -> Qwen3-Coder (Receiver)   ... plan latents
+- DeepSeek (Verifier) -> Qwen3-Coder (Receiver) ... critique latents
 
----
-
-## 5. ターンの流れ（最大5ターン）
-1. Q → Coordinator が符号化 → Thinker を起動
-2. Thinker(GLM) が Q を prefill し計画を生成（KV = Sharer）
-3. Coordinator が統合を指示 → C2C(Thinker→Receiver) が計画潜在を Qwen3-Coder に注入 → Receiver が成果物（正確なコード）を生成
-4. Coordinator が検証を指示 → Verifier(DeepSeek) が Q＋正確な成果物テキストを読み、ACCEPT/REVISE＋批評を出力
-5. REVISE なら（§6の対策に従い）Receiver を新規 prefill で再構成 → ループ
-6. ACCEPT で終了 → 成果物を返す
+The Worker->Verifier direction needs no fuser. Passing the artifact as "exact text" is enough.
 
 ---
 
-## 6. REVISE逆辺の罠と対策（最重要）
-Verifier→Worker で同じWorkerの履歴を継続使用するとC2Cが壊れる
-（生成済みWorkerに、別軌道のVerifier由来潜在を注入＝KV不整合）。
+## 4. Dual channel (latent + exact text)
+- latent channel (C2C): soft intent / plan prior / critique / uncertainty -> fused into the Receiver
+- exact channel (text): code / proofs / artifacts (things that must not ride a lossy fusion)
 
-対策: REVISEを「継続」ではなく「新規統合パス」として扱う。
-- Receiver を正準テキスト状態から再 prefill: `プロンプト + 正確な成果物 + Verifierの正確な批評テキスト`
-- ＋任意で Verifier→Receiver 潜在を、まっさらな prefill に注入
+Principle: carry "intent as latent, the concrete thing as text." Do not insist on a purely latent handoff.
 
 ---
 
-## 7. 学習順序（co-train しない）
-1. テキストのみのローカルTrinityを先に構築（C2C無しのベースライン）
-2. Thinker→Receiver fuser を学習・評価
-3. Verifier→Receiver 批評 fuser を「新規再構成プロトコル」で学習
-4. Worker→Verifier は最後（正確テキストで足りる可能性が高い）
-5. 役割・fuser を凍結した上で、最後に Coordinator を sep-CMA-ES で学習
+## 5. Turn flow (up to 5 turns)
+1. Q -> the Coordinator encodes it -> invokes the Thinker
+2. Thinker (GLM) prefills Q and generates a plan (KV = Sharer)
+3. Coordinator orders integration -> C2C (Thinker->Receiver) injects the plan latents into Qwen3-Coder -> Receiver generates the artifact (exact code)
+4. Coordinator orders verification -> Verifier (DeepSeek) reads Q + the exact artifact text and outputs ACCEPT/REVISE + a critique
+5. If REVISE (following the mitigation in §6), reconstruct the Receiver with a fresh prefill -> loop
+6. On ACCEPT, finish -> return the artifact
 
 ---
 
-## 8. インフラ / GPU
-- 現実解: 1ノード 2×80GB（A100/H100）。7B–32B級を複数同時・KV常駐・実験込みで回すならこれが妥当。
-- 1×80GB: 量子化＋オフロードで可能だが窮屈。
-- 1×24GB: プロトタイプ専用（小型・量子化のみ）。
-- サービング: KVへの生アクセスと注入フックを持つ vLLM 系（aLoRA対応エンジン 2512.17910 が近い土台）。
-- 量子化: AWQ / GPTQ / FP8。C2Cは両モデルのprefillが常駐する前提でKVメモリを確保。
+## 6. The REVISE back-edge trap and its mitigation (most important)
+Continuing to reuse the same Worker's history on Verifier->Worker breaks C2C
+(injecting Verifier-derived latents from a different trajectory into an already-generated Worker = KV inconsistency).
+
+Mitigation: treat REVISE as a "new integration path," not a "continuation."
+- Re-prefill the Receiver from a canonical text state: `prompt + exact artifact + Verifier's exact critique text`
+- + optionally inject Verifier->Receiver latents into the fresh prefill
 
 ---
 
-## 9. トップ3リスク
-1. 履歴分岐によるKV不整合 → REVISEは新規再構成で回避
-2. 弱い/ノイズの多い潜在注入 → 役割モデルを同等以上の強さに保つ＋層ゲート
-3. モデル/役割変更時のfuserの脆さ → 役割ラインナップを凍結、入替時はfuser再学習
+## 7. Training order (do not co-train)
+1. First build a text-only local Trinity (a baseline without C2C)
+2. Train and evaluate the Thinker->Receiver fuser
+3. Train the Verifier->Receiver critique fuser with the "fresh-reconstruction protocol"
+4. Worker->Verifier last (exact text is likely sufficient)
+5. With roles and fusers frozen, finally train the Coordinator with sep-CMA-ES
 
 ---
 
-## 10. 段階的構築
-- P0: テキストのみローカルTrinity（C2C無し）で動作＆精度の土台
-- P1: Thinker→Receiver の1本だけC2C化し、テキスト版とA/B比較
-- P2: 2本のfuser＋凍結Coordinatorで完成
+## 8. Infrastructure / GPU
+- Practical answer: one node with 2x80GB (A100/H100). Reasonable for running several 7B-32B-class models at once, KV resident, experiments included.
+- 1x80GB: possible with quantization + offload, but cramped.
+- 1x24GB: prototyping only (small, quantized models only).
+- Serving: a vLLM-family engine with raw KV access and injection hooks (the aLoRA-capable engine of 2512.17910 is a close foundation).
+- Quantization: AWQ / GPTQ / FP8. C2C assumes both models' prefills stay resident, so budget KV memory accordingly.
 
 ---
 
-## 設計の要点（まとめ）
-C2Cの弱点（履歴分岐・伝言ゲーム）を「star ＋ 新規再構成 ＋ 二重チャネル」で回避し、
-誤り非相関は Qwen / GLM / DeepSeek の系統分散で確保する。
-すべてローカル・オープンモデルで完結し、クローズドAIは不要。
+## 9. Top 3 risks
+1. KV inconsistency from history divergence -> avoid via fresh reconstruction on REVISE
+2. Weak / noisy latent injection -> keep role models at comparable-or-greater strength + layer gates
+3. Fuser fragility when models/roles change -> freeze the role lineup; retrain the fusers on any swap
+
+---
+
+## 10. Phased build-out
+- P0: text-only local Trinity (no C2C) for a working baseline of behavior & accuracy
+- P1: C2C-ify only the Thinker->Receiver edge and A/B-compare against the text version
+- P2: complete it with the two fusers + a frozen Coordinator
+
+---
+
+## Design summary
+Work around C2C's weaknesses (history divergence, latent telephone) with
+"star + fresh reconstruction + dual channel," and secure error decorrelation through lineage
+diversity across Qwen / GLM / DeepSeek.
+Everything runs on local/open models; no closed AI needed.

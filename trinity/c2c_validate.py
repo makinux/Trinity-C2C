@@ -1,18 +1,19 @@
 """
-P1(a): 同一ファミリ C2C 最小検証
+P1(a): minimal same-family C2C validation
 ================================
-狙い: 「Sharer の KV を Receiver に融合すると、送信側の内容が受信側の生成に転移するか」を
-制御実験で確認する。同一ファミリ(同一トークナイザ・互換shape)なら token alignment と GQA の
-ブロッカーが消えるため、C2Cの潜在転移そのものを最小条件で検証できる。
+Aim: confirm via a controlled experiment whether "fusing the Sharer's KV into the Receiver transfers
+the sharer-side content into the receiver's generation". For the same family (same tokenizer, compatible
+shapes) the token-alignment and GQA blockers disappear, so the C2C latent transfer itself can be
+validated under minimal conditions.
 
-- mock検証(torch不要・この場で実行可): TinyMockLM で「gate=0→受信内容 / gate=1→送信内容」を定量確認。
-  steering(送信-受信)が gate に対し単調増加することを assert。
-- 実機検証(GPU): InProcessLM(Qwen3) で同じ手順。self-C2C(同一モデルを送受) が最もクリーン。
-  次に Qwen3-0.6B(Thinker) → Qwen3-Coder(Worker) へ拡張（層整合＋head_dim射影を行使。n_kv_heads一致が条件）。
+- mock check (no torch, runnable here): with TinyMockLM, quantitatively confirm "gate=0 -> receiver content / gate=1 -> sharer content".
+  Assert that steering (sharer - receiver) increases monotonically in the gate.
+- real check (GPU): the same procedure with InProcessLM(Qwen3). self-C2C (same model as sharer and receiver) is cleanest.
+  Then extend to Qwen3-0.6B(Thinker) -> Qwen3-Coder(Worker) (exercising layer alignment + head_dim projection; requires matching n_kv_heads).
 
-実行:
-  python -m trinity.c2c_validate --selftest   # mock検証(torch不要)
-  python -m trinity.c2c_validate --real       # 実機 self-C2C (Qwen3-0.6B)
+Run:
+  python -m trinity.c2c_validate --selftest   # mock check (no torch)
+  python -m trinity.c2c_validate --real       # real self-C2C (Qwen3-0.6B)
 """
 from __future__ import annotations
 
@@ -23,11 +24,11 @@ from trinity.c2c import (
     KVShape, KVCache, C2CFuser, IdentityTokenAligner,
 )
 
-VOCAB = "ABCD"          # token id = index。head_dim>=len(VOCAB)。
+VOCAB = "ABCD"          # token id = index. head_dim >= len(VOCAB).
 
 
 # ============================================================
-# TinyMockLM: InProcessLM 互換の極小ダミー。KVに「どのトークンが居たか」を埋め込む。
+# TinyMockLM: a tiny InProcessLM-compatible dummy. Embeds "which token was present" into the KV.
 # ============================================================
 class TinyMockLM:
     def __init__(self, n_layers: int = 4, n_heads: int = 2, head_dim: int = 4):
@@ -58,14 +59,14 @@ class TinyMockLM:
     def _aggregate(self, fused: KVCache) -> np.ndarray:
         agg = np.zeros(self.head_dim)
         for (_, V) in fused.layers:
-            agg += V.sum(axis=(0, 1))      # 全層・全ヘッド・全位置のVを集約
+            agg += V.sum(axis=(0, 1))      # aggregate V over all layers, heads, and positions
         return agg
 
     def generate_from_kv(self, fused: KVCache, prompt: str, max_new_tokens: int = 1) -> str:
         return VOCAB[int(np.argmax(self._aggregate(fused)))]
 
     def next_logprobs(self, fused: KVCache, targets) -> dict:
-        """実機 forward_logprobs の mock版（aggregateを次トークンlogitsとみなす）。"""
+        """Mock of the real forward_logprobs (treats the aggregate as next-token logits)."""
         z = self._aggregate(fused)
         z = z - z.max()
         logp = z - np.log(np.exp(z).sum())
@@ -73,13 +74,13 @@ class TinyMockLM:
 
 
 # ============================================================
-# steering 実験: gate を振って「受信内容→送信内容」への転移を測る
+# steering experiment: sweep the gate to measure transfer from "receiver content -> sharer content"
 # ============================================================
 def steering_sweep(lm, fuser: C2CFuser, recv_text: str, share_text: str,
                    gates=(0.0, 0.25, 0.5, 0.75, 1.0), verbose: bool = True):
     recv_kv, recv_tok = lm.encode(recv_text)
     share_kv, share_tok = lm.encode(share_text)
-    share_kv = IdentityTokenAligner().align(share_kv, share_tok, recv_tok)   # 同一トークナイザ＝恒等
+    share_kv = IdentityTokenAligner().align(share_kv, share_tok, recv_tok)   # same tokenizer = identity
     rows = []
     for g in gates:
         fuser.set_gate(g)
@@ -95,14 +96,14 @@ def steering_sweep(lm, fuser: C2CFuser, recv_text: str, share_text: str,
 
 
 # ============================================================
-# mock検証（torch不要）
+# mock check (no torch)
 # ============================================================
 def selftest() -> None:
-    # ※ これは「配線(encode→fuse→inject→readout)＋ゲート＋指標計算」の検証であり、
-    #   実LMの意味的転移そのものの証明ではない（それはGPUの real_validation で）。Codex指摘を明記。
+    # Note: this validates the wiring (encode -> fuse -> inject -> readout) + gate + metric computation,
+    #   not a proof of semantic transfer in a real LM (that's the GPU real_validation). Stated per Codex.
     lm = TinyMockLM(n_layers=4, n_heads=2, head_dim=4)
-    fuser = C2CFuser.init(lm.kv_shape(), lm.kv_shape(), seed=0)   # 同一shape→恒等射影
-    print("[plumbing] Receiver='AAAA'(自分の内容) / Sharer='BBBB'(注入内容) ※等長・接頭で識別=正しい実験形")
+    fuser = C2CFuser.init(lm.kv_shape(), lm.kv_shape(), seed=0)   # same shape -> identity projection
+    print("[plumbing] Receiver='AAAA' (own content) / Sharer='BBBB' (injected content). Note: equal length, distinguished by prefix = correct experimental form")
     recv_kv, rt = lm.encode("AAAA")
     share_kv, st = lm.encode("BBBB")
     share_kv = IdentityTokenAligner().align(share_kv, st, rt)
@@ -120,43 +121,43 @@ def selftest() -> None:
 
     outs = {g: o for (g, o, _) in rows}
     assert outs[0.0] == "A" and outs[1.0] == "B"
-    print("[plumbing] gate=0→受信(A) / gate=1→送信(B) / steering単調増加  ✓")
+    print("[plumbing] gate=0 -> receiver(A) / gate=1 -> sharer(B) / steering monotonic increase  OK")
 
-    # Δ次トークンlogprob 指標（実機 forward_logprobs と同形）を mock で検証
+    # validate the delta next-token-logprob metric (same form as the real forward_logprobs) with the mock
     fuser.set_gate(0.0); lp0 = lm.next_logprobs(fuser.fuse(recv_kv, share_kv), ["A", "B"])
     fuser.set_gate(1.0); lp1 = lm.next_logprobs(fuser.fuse(recv_kv, share_kv), ["A", "B"])
     dB = lp1["B"] - lp0["B"]
     assert dB > 0
-    print(f"[plumbing] Δlogp('B') gate0→1 = {dB:+.2f} (>0: 注入で送信tokenの確率が上がる=指標が機能)")
-    print("[plumbing] ALL PASSED  ※意味的転移の確認は GPU の --real で")
+    print(f"[plumbing] delta-logp('B') gate0->1 = {dB:+.2f} (>0: injection raises the sharer token's probability = the metric works)")
+    print("[plumbing] ALL PASSED  Note: confirm semantic transfer with GPU --real")
 
 
 # ============================================================
-# 実機検証（GPU・Qwen3）
+# real check (GPU, Qwen3)
 # ============================================================
 def real_validation_self(model: str = "Qwen/Qwen3-0.6B") -> None:
-    """self-C2C 転移の定量検証（Codex指摘の交絡を回避した設計）。
-    因果マスク制約: 識別情報は『接頭』に置く（後置だとprefix位置のKVに乗らない）。
-    位置整合: send/recv を『等長』にして同一トークナイザの位置対応を成立させる。
-    指標: Δ次トークンlogprob。gate↑で送信側ターゲットの確率が上がれば転移が起きている。"""
+    """Quantitative validation of self-C2C transfer (designed to avoid the confounds Codex flagged).
+    Causal-mask constraint: put the distinguishing info in the 'prefix' (a suffix would not land on the prefix-position KV).
+    Position alignment: make send/recv 'equal length' so the same-tokenizer position correspondence holds.
+    Metric: delta next-token-logprob. If the sharer-side target's probability rises as the gate goes up, transfer is happening."""
     from trinity.c2c import InProcessLM
     lm = InProcessLM(model)
     sh = lm.kv_shape()
     fuser = C2CFuser.init(sh, sh, seed=0)
 
-    share_ctx = "Country: France.\nThe capital city is"     # 送信: France文脈（接頭で識別）
-    recv_ctx = "Country: Japan.\nThe capital city is"       # 受信: Japan文脈（等長）
+    share_ctx = "Country: France.\nThe capital city is"     # sharer: France context (distinguished by prefix)
+    recv_ctx = "Country: Japan.\nThe capital city is"       # receiver: Japan context (equal length)
     n_s = len(lm.tok(share_ctx, add_special_tokens=False)["input_ids"])
     n_r = len(lm.tok(recv_ctx, add_special_tokens=False)["input_ids"])
     if n_s != n_r:
-        print(f"  ⚠️ send/recvが等長でない({n_s}≠{n_r}) → 位置整合が崩れる。語を調整するか TokenAligner を実装。")
+        print(f"  [!] send/recv are not equal length ({n_s}!={n_r}) -> position alignment breaks. Adjust the wording or implement a TokenAligner.")
 
     share_kv, stok = lm.encode(share_ctx)
     recv_kv, rtok = lm.encode(recv_ctx)
     share_kv = IdentityTokenAligner().align(share_kv, stok, rtok)
-    targets = [" Paris", " Tokyo"]                          # 送信側=Paris / 受信側=Tokyo
-    cont = " "                                              # 短い継続で「文脈の次トークン分布」を読む
-    print(f"[real] self-C2C {model}: recv=Japan文脈 に France文脈KVを注入 → Δlogp を測る")
+    targets = [" Paris", " Tokyo"]                          # sharer-side = Paris / receiver-side = Tokyo
+    cont = " "                                              # read the context's next-token distribution with a short continuation
+    print(f"[real] self-C2C {model}: inject France-context KV into recv=Japan-context -> measure delta-logp")
     base = None
     for g in (0.0, 0.3, 0.6, 1.0):
         fuser.set_gate(g)
@@ -165,23 +166,23 @@ def real_validation_self(model: str = "Qwen/Qwen3-0.6B") -> None:
         if g == 0.0:
             base = lp
         d = {t: round(lp[t] - base[t], 2) for t in targets}
-        print(f"  gate={g}: logp={ {t: round(lp[t], 2) for t in targets} }  Δ={d}")
-    print("  期待(転移が効けば): gate↑で Δlogp(' Paris')>0, Δlogp(' Tokyo')<0")
-    print("  ※ 因果制約・等長前提を満たす最小設計。HF版のKV注入挙動に依存するため実機で要確認。")
+        print(f"  gate={g}: logp={ {t: round(lp[t], 2) for t in targets} }  d={d}")
+    print("  Expected (if transfer works): as the gate rises, delta-logp(' Paris')>0, delta-logp(' Tokyo')<0")
+    print("  Note: a minimal design meeting the causal constraint and equal-length premise. Depends on the HF version's KV-injection behavior, so verify on real hardware.")
 
 
 def real_validation_cross(thinker_model: str = "Qwen/Qwen3-0.6B",
                           worker_model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct") -> None:
-    """Qwen3-0.6B(Thinker) → Qwen3-Coder(Worker)。層整合＋head_dim射影を行使。n_kv_heads一致が条件。"""
+    """Qwen3-0.6B(Thinker) -> Qwen3-Coder(Worker). Exercises layer alignment + head_dim projection. Requires matching n_kv_heads."""
     from trinity.c2c import InProcessLM
     th, wk = InProcessLM(thinker_model), InProcessLM(worker_model)
     sh, rh = th.kv_shape(), wk.kv_shape()
     print(f"[real-cross] thinker {sh} / worker {rh}")
     if sh.n_heads != rh.n_heads:
-        print(f"  ⚠️ n_kv_heads不一致({sh.n_heads}≠{rh.n_heads}) → ヘッド射影が未実装のため fuser.init は失敗する。"
-              f"  まずは self-C2C か n_kv_heads一致ペアで検証を。")
+        print(f"  [!] n_kv_heads mismatch ({sh.n_heads}!={rh.n_heads}) -> head projection is unimplemented, so fuser.init will fail."
+              f"  First validate with self-C2C or an n_kv_heads-matching pair.")
         return
-    fuser = C2CFuser.init(sh, rh, seed=0)   # 層整合(terminal)＋head_dim射影が効く
+    fuser = C2CFuser.init(sh, rh, seed=0)   # terminal layer alignment + head_dim projection apply
     query = "Write a function `add(a,b)` that returns a+b."
     share_kv, stok = th.encode(query + "\n\n(plan: just return a+b)")
     recv_kv, rtok = wk.encode(query)

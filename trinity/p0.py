@@ -1,21 +1,21 @@
 """
-P0: テキスト版ローカルTrinity（C2C無し）最小骨子
+P0: minimal text-only local Trinity (no C2C)
 =================================================
-目的: Coordinator・3役割（Thinker/Worker/Verifier）・ループ制御を、
-      まず "テキストの共有トランスクリプト" だけで動かす。C2C(潜在融合)は後のP1/P2で追加する。
+Goal: get the Coordinator, the 3 roles (Thinker/Worker/Verifier), and loop control running
+      on just a "shared text transcript" first. C2C (latent fusion) is added later in P1/P2.
 
-設計対応:
-  - star型: Worker(=Receiver) が中心の統合点。Thinker/Verifier はトランスクリプト経由で寄与。
-  - 誤りの非相関: 役割ごとに別系統モデル（Thinker=GLM / Worker=Qwen3-Coder / Verifier=DeepSeek-R1）。
-  - 連続性: どのモデルの内部状態にも依存せず、文脈は外部テキスト(transcript)に宿す（Trinityの肝）。
+Design mapping:
+  - star type: the Worker (=Receiver) is the central integration point. Thinker/Verifier contribute via the transcript.
+  - error decorrelation: a different model lineage per role (Thinker=GLM / Worker=Qwen3-Coder / Verifier=DeepSeek-R1).
+  - continuity: depends on no model's internal state; context lives in the external text (transcript) (the heart of Trinity).
 
-ローカルサービング例（各モデルをOpenAI互換で個別ポートに立てる）:
+Local serving example (stand up each model on its own port, OpenAI-compatible):
   vllm serve <glm-path>          --port 8001 --served-model-name glm-4
   vllm serve <qwen3-coder-path>  --port 8002 --served-model-name qwen3-coder
   vllm serve <deepseek-r1-path>  --port 8003 --served-model-name deepseek-r1-distill
 
-依存: pip install openai>=1.0
-実行: python -m trinity.p0
+Depends: pip install openai>=1.0
+Run: python -m trinity.p0
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from trinity.config import CONFIG
 
 
 # ============================================================
-# 1. モデルプール（ローカル OpenAI 互換エンドポイント）
+# 1. Model pool (local OpenAI-compatible endpoints)
 # ============================================================
 @dataclass
 class LocalModel:
@@ -43,7 +43,7 @@ class LocalModel:
 
     def _ensure_client(self):
         if self._client is None:
-            from openai import OpenAI          # 遅延import: スコアラー/テストはSDK不要
+            from openai import OpenAI          # lazy import: scorer/tests need no SDK
             self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
         return self._client
 
@@ -59,7 +59,7 @@ class LocalModel:
 
 
 def _build_pool() -> dict[str, "LocalModel"]:
-    """config.yml の models セクションから「役割→モデル」を構築。"""
+    """Build role -> model from the models section of config.yml."""
     pool = {}
     for role, m in CONFIG["models"].items():
         pool[role] = LocalModel(m.get("name", role), m["base_url"], m["model_id"],
@@ -73,7 +73,7 @@ POOL: dict[str, "LocalModel"] = _build_pool()
 
 
 # ============================================================
-# 2. 役割定義とシステムプロンプト
+# 2. Role definitions and system prompts
 # ============================================================
 class Role(str, Enum):
     THINKER = "thinker"
@@ -82,7 +82,7 @@ class Role(str, Enum):
 
 
 def _prompt_for(role: "Role") -> str:
-    """models.<role>.system_prompt があれば優先、無ければ prompts.<role>。"""
+    """Prefer models.<role>.system_prompt if present, else prompts.<role>."""
     return CONFIG["models"].get(role.value, {}).get("system_prompt") or CONFIG["prompts"][role.value]
 
 
@@ -90,7 +90,7 @@ SYS: dict[Role, str] = {r: _prompt_for(r) for r in Role}
 
 
 # ============================================================
-# 3. 状態（共有外部トランスクリプト）
+# 3. State (shared external transcript)
 # ============================================================
 @dataclass
 class Turn:
@@ -103,7 +103,7 @@ class Turn:
 class State:
     query: str
     turns: list[Turn] = field(default_factory=list)
-    artifact: Optional[str] = None     # 最新の Worker 成果物（star型の中心生成物）
+    artifact: Optional[str] = None     # the latest Worker artifact (the central product in the star type)
 
     def latest_critique(self) -> str:
         for t in reversed(self.turns):
@@ -112,7 +112,7 @@ class State:
         return ""
 
     def transcript(self, max_chars: int = 12000) -> str:
-        """共有外部トランスクリプト。長くなりすぎたら QUERY + 末尾の数ターンに圧縮。"""
+        """Shared external transcript. If it grows too long, compress to QUERY + the last few turns."""
         head = f"[QUERY]\n{self.query}"
         blocks = [f"[{t.role.value.upper()} #{i} ({t.model})]\n{t.output}"
                   for i, t in enumerate(self.turns, 1)]
@@ -126,11 +126,11 @@ class State:
                 break
             kept.insert(0, b)
             budget -= len(b)
-        return "\n\n".join([head, "...(中略)...", *kept])
+        return "\n\n".join([head, "...(omitted)...", *kept])
 
 
 # ============================================================
-# 4. パース系ユーティリティ
+# 4. Parsing utilities
 # ============================================================
 class Verdict(str, Enum):
     ACCEPT = "ACCEPT"
@@ -138,7 +138,7 @@ class Verdict(str, Enum):
 
 
 def parse_verdict(text: str) -> Verdict:
-    """最後の VERDICT 行を採用（本文中の引用に引っ張られないように）。既定は安全側(REVISE)。"""
+    """Use the last VERDICT line (so quotes in the body don't mislead it). Default to the safe side (REVISE)."""
     matches = re.findall(r"(?im)^\s*VERDICT:\s*(ACCEPT|REVISE)\s*$", text)
     if not matches:
         matches = re.findall(r"(?i)VERDICT:\s*(ACCEPT|REVISE)", text)
@@ -146,31 +146,31 @@ def parse_verdict(text: str) -> Verdict:
 
 
 def strip_think(text: str) -> str:
-    """reasoning系(DeepSeek/Qwen)の <think>/<thinking> を除去（未閉じも末尾まで）。"""
+    """Strip <think>/<thinking> from reasoning models (DeepSeek/Qwen) (including an unclosed tag to the end)."""
     text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.S | re.I)
     text = re.sub(r"<think(?:ing)?>.*\Z", "", text, flags=re.S | re.I)
     return text.strip()
 
 
 # ============================================================
-# 5. Coordinator（P0は決め打ち。将来 sep-CMA-ES + 小型SLMヘッドに差し替え）
+# 5. Coordinator (P0 is hard-coded; later replaced by sep-CMA-ES + a small SLM head)
 # ============================================================
 @dataclass
 class Action:
     role: Role
     model_key: str
-    meta: dict = field(default_factory=dict)   # 将来: ロジット/スコア等(sep-CMA-ES用)
+    meta: dict = field(default_factory=dict)   # future: logits/scores etc. (for sep-CMA-ES)
 
 
 class Coordinator:
-    """拡張点: ここを学習済みコーディネータ(Qwen3-0.6B + head, sep-CMA-ES)に差し替える。
-    学習版では decide() に「生transcriptではなく圧縮特徴量」を渡す設計にする。"""
+    """Extension point: replace this with a learned coordinator (Qwen3-0.6B + head, sep-CMA-ES).
+    In the learned version, decide() is designed to receive "compressed features rather than the raw transcript"."""
     def decide(self, state: State) -> Optional[Action]:
         raise NotImplementedError
 
 
 class ScriptedCoordinator(Coordinator):
-    """P0用: Thinker -> Worker -> Verifier -> (REVISEなら Worker -> Verifier ...) の固定フロー。"""
+    """For P0: the fixed flow Thinker -> Worker -> Verifier -> (if REVISE, Worker -> Verifier ...)."""
     def decide(self, state: State) -> Optional[Action]:
         if not state.turns:
             return Action(Role.THINKER, "thinker")
@@ -180,31 +180,31 @@ class ScriptedCoordinator(Coordinator):
         if last == Role.WORKER:
             return Action(Role.VERIFIER, "verifier")
         if last == Role.VERIFIER:
-            return Action(Role.WORKER, "worker")   # REVISE継続（ACCEPT終了はループ側で判定）
+            return Action(Role.WORKER, "worker")   # continue on REVISE (ACCEPT termination is decided by the loop)
         return None
 
 
 # ============================================================
-# 6. 役割別ユーザープロンプト生成（Worker/Verifierには成果物・批評を明示注入）
+# 6. Per-role user-prompt construction (explicitly inject artifact/critique for Worker/Verifier)
 # ============================================================
 def build_user_prompt(role: Role, state: State) -> str:
     if role == Role.THINKER:
-        return f"{state.transcript()}\n\n[TASK] 上記クエリへの計画・分解・要点を簡潔に。コードは書かない。"
+        return f"{state.transcript()}\n\n[TASK] Concisely give a plan, decomposition, and key points for the query above. Do not write code."
     if role == Role.WORKER:
         critique = state.latest_critique()
-        extra = f"\n\n[直近の指摘(あれば反映)]\n{critique}" if critique else ""
+        extra = f"\n\n[Latest feedback (incorporate if any)]\n{critique}" if critique else ""
         return (f"{state.transcript()}{extra}\n\n"
-                f"[TASK] 計画/批評を踏まえ最終解（完全なコード/導出）を作れ。既存成果物があれば土台に改善する。")
+                f"[TASK] Building on the plan/critique, produce the final solution (complete code/derivation). If a prior artifact exists, improve on it as the base.")
     if role == Role.VERIFIER:
-        art = state.artifact or "(まだ成果物なし)"
-        return (f"[QUERY]\n{state.query}\n\n[点検対象=最新のWorker成果物]\n{art}\n\n"
-                f"[TASK] この成果物がクエリを正しく・完全に満たすか点検し、"
-                f"最終行に 'VERDICT: ACCEPT' か 'VERDICT: REVISE'。REVISEなら修正点も。")
+        art = state.artifact or "(no artifact yet)"
+        return (f"[QUERY]\n{state.query}\n\n[Under review = latest Worker artifact]\n{art}\n\n"
+                f"[TASK] Check whether this artifact correctly and completely satisfies the query, and "
+                f"put 'VERDICT: ACCEPT' or 'VERDICT: REVISE' on the last line. If REVISE, list the fixes.")
     raise ValueError(role)
 
 
 # ============================================================
-# 7. オーケストレーション・ループ
+# 7. Orchestration loop
 # ============================================================
 @dataclass
 class Config:
@@ -227,10 +227,10 @@ def run(query: str, coordinator: Coordinator, pool: dict[str, LocalModel],
         user = build_user_prompt(action.role, state)
         try:
             out = model.chat(SYS[action.role], user)
-        except Exception as e:                       # 呼び出し失敗は中断（P0は単純に）
+        except Exception as e:                       # a call failure aborts (P0 keeps it simple)
             error = f"{model.name} call failed: {e}"
             break
-        if not out:                                  # 空応答は成果物にしない
+        if not out:                                  # don't treat an empty response as an artifact
             error = f"{model.name} returned empty output"
             break
 
@@ -241,7 +241,7 @@ def run(query: str, coordinator: Coordinator, pool: dict[str, LocalModel],
         if action.role == Role.WORKER:
             state.artifact = out
         if (action.role == Role.VERIFIER
-                and state.artifact                      # 成果物がある時のみ…
+                and state.artifact                      # only when an artifact exists ...
                 and parse_verdict(out) == Verdict.ACCEPT):
             final = state.artifact
             break
@@ -255,16 +255,16 @@ def run(query: str, coordinator: Coordinator, pool: dict[str, LocalModel],
 
 
 # ============================================================
-# 8. 評価ハーネス雛形（P0を学習/比較のベースラインにする最重要ピース）
+# 8. Evaluation harness template (the key piece that makes P0 the training/comparison baseline)
 # ============================================================
 @dataclass
 class Task:
     query: str
-    scorer: Callable[[str], bool]    # 成果物テキスト -> 合否（外部採点：単体テスト/数値一致 等）
+    scorer: Callable[[str], bool]    # artifact text -> pass/fail (external scoring: unit tests / numeric match, etc.)
 
 
 def evaluate(tasks: list[Task], coordinator: Coordinator, pool: dict[str, LocalModel] = POOL) -> float:
-    """固定タスク集合での合格率。方策(coordinator)の比較に使う＝reward()の実体。"""
+    """Pass rate over a fixed task set. Used to compare policies (coordinators) = the concrete reward()."""
     ok = 0
     for task in tasks:
         res = run(task.query, coordinator, pool, Config(verbose=False))
@@ -274,13 +274,13 @@ def evaluate(tasks: list[Task], coordinator: Coordinator, pool: dict[str, LocalM
 
 
 def reward(query: str, result: dict) -> float:
-    """終端の二値報酬(0/1)。sep-CMA-ES導入時の目的関数。今はaccept有無の暫定。"""
+    """Terminal binary reward (0/1). The objective once sep-CMA-ES is introduced. For now, a placeholder based on whether it was accepted."""
     return 1.0 if result.get("accepted") else 0.0
 
 
 # ============================================================
 if __name__ == "__main__":
-    q = "2つのソート済みリストをマージする関数をPythonで書け。計算量も示せ。"
+    q = "Write a Python function that merges two sorted lists. Also state its time complexity."
     result = run(q, ScriptedCoordinator(), POOL)
     print("\n==================== RESULT ====================")
     print("ACCEPTED:", result["accepted"], "| ERROR:", result["error"])

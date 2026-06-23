@@ -1,17 +1,17 @@
 """
-P1: データ規模学習で「汎化」を狙う（最後のフロンティア）
+P1: aim for "generalization" via data-scale training (the final frontier)
 =====================================================
-これまで単一例では fuser が記憶するだけで held-out 汎化しなかった。Codexのレシピで再挑戦:
-  - 関係データ(国→首都) ~40件、train/held-out 分割
-  - 受信は固定プレースホルダ "Country: Unknown..."、送信が実国 → fuser が「国の同一性」を注入
-  - contrastive: 正しい送信は誤った送信より target を高く（share内容を使うよう強制）
-  - 正則化: 射影Wを恒等近傍にL2（記憶容量を抑制）
-判定: held-out で mean(learned) < mean(gate0) なら『注入が未知国でも効く＝真の汎化』。
-      mean(learned) < mean(shuffled) なら『正しいshare内容を使用』。
+So far, with a single example the fuser merely memorized and did not generalize to held-out. Retry with Codex's recipe:
+  - relational data (country -> capital), ~40 items, split into train/held-out
+  - the receiver is a fixed placeholder "Country: Unknown...", the sharer is a real country -> the fuser injects "country identity"
+  - contrastive: the correct sharer should score the target higher than a wrong sharer (forces it to use the share content)
+  - regularization: L2 the projection W toward the identity neighborhood (suppress memorization capacity)
+Verdict: on held-out, if mean(learned) < mean(gate0), "injection works even for unseen countries = true generalization".
+      If mean(learned) < mean(shuffled), "uses the correct share content".
 
-効率: 凍結エンコード(送信/受信KV)は1回だけ計算してキャッシュ。学習は継続1トークンの forward/backward のみ。
+Efficiency: the frozen encodings (sharer/receiver KV) are computed once and cached. Training is only the forward/backward of a single continuation token.
 
-実行: python -m trinity.c2c_train_general
+Run: python -m trinity.c2c_train_general
 """
 import numpy as np
 import torch
@@ -46,7 +46,7 @@ RECV = "Country: Unknown.\nThe capital city is"
 
 
 def main():
-    print(f"[load] {MODEL} (frozen) …")
+    print(f"[load] {MODEL} (frozen) ...")
     tok = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="eager").eval()
     for p in model.parameters():
@@ -71,7 +71,7 @@ def main():
     recv_layers = [(rK[l], rV[l]) for l in range(shape.n_layers)]
     rp = list(range(Lr))
 
-    # 各国の送信エンコードをキャッシュ
+    # cache each country's sharer encoding
     cache_c = {}
     for c, cap in PAIRS:
         sK, sV, s_ids, s_off = encode(f"Country: {c}.\nThe capital city is")
@@ -83,7 +83,7 @@ def main():
     W_init = {k: v.detach().clone() for k, v in {**fuser.Wk, **fuser.Wv}.items()}
 
     def logp_target(country, sharer_country):
-        """sharer_country の KV を recv に融合し、country の首都(=target)の logp。"""
+        """Fuse sharer_country's KV into recv and return the logp of country's capital (= target)."""
         d, sd = cache_c[country], cache_c[sharer_country]
         fused = fuser.fuse(recv_layers, sd["sK"], sd["sV"], sd["sp"], sd["gidx"], rp)
         cache = DynamicCache()
@@ -102,7 +102,7 @@ def main():
     countries = [c for c, _ in PAIRS]
     rng.shuffle(countries)
     train, held = countries[:24], countries[24:]
-    print(f"[data] train={len(train)} held-out={len(held)} 国")
+    print(f"[data] train={len(train)} held-out={len(held)} countries")
 
     opt = torch.optim.Adam(fuser.parameters(), lr=0.08)
     MARGIN, LAM_C, LAM_R = 2.0, 1.0, 1e-3
@@ -131,18 +131,18 @@ def main():
             print(f"  step {step:2d} | loss {loss.item():.3f} | gate {torch.sigmoid(fuser.gate_logit).mean():.2f} "
                   f"| held-out logp: learned={lrn:.2f} gate0={g0:.2f} shuffled={shf:.2f}")
 
-    fuser.eval()                                          # 最終 fuser で held-out 再評価
+    fuser.eval()                                          # re-evaluate held-out with the final fuser
     with torch.no_grad():
         lrn = np.mean([float(logp_target(c, c)) for c in held])
         shf = np.mean([float(logp_target(c, held[(held.index(c) + 1) % len(held)])) for c in held])
     g0 = np.mean([logp_gate0(c) for c in held])
 
-    print("\n[held-out 判定]")
-    print(f"  learned > gate0 か? {'YES→注入が未知国でも有効=汎化✓' if lrn > g0 else 'NO→まだ汎化不十分'}"
+    print("\n[held-out verdict]")
+    print(f"  learned > gate0? {'YES -> injection is effective even for unseen countries = generalization' if lrn > g0 else 'NO -> not yet generalizing enough'}"
           f"  (learned={lrn:.2f} vs gate0={g0:.2f})")
-    print(f"  learned > shuffled か? {'YES→正しいshare内容を使用✓' if lrn > shf else 'NO'}"
+    print(f"  learned > shuffled? {'YES -> uses the correct share content' if lrn > shf else 'NO'}"
           f"  (learned={lrn:.2f} vs shuffled={shf:.2f})")
-    print("  ※ logpなので大きいほど良い。learned>gate0 かつ learned>shuffled が汎化の証拠。")
+    print("  Note: this is logp, so higher is better. learned>gate0 and learned>shuffled is the evidence of generalization.")
 
 
 if __name__ == "__main__":

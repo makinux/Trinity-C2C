@@ -1,18 +1,18 @@
 """
-P1: 異種fuserの学習統合（収束点）
+P1: training integration of the heterogeneous fuser (the convergence point)
 =================================
-これまでの部品を1つの学習可能 torch モジュールに統合:
-  - 異種射影 W_k/W_v: [H_s·hd_s → H_r·hd_r]（GQA/ヘッド/次元の不一致を吸収・学習）
-  - RoPE-aware K経路: unrotate(送信inv_freq・送信位置)→gather→射影→受信RoPE(受信inv_freq・受信位置)
-  - V経路: gather→射影（回転なし）
-  - 層ごと Gumbel-sigmoid ゲート
-学習: 送信/受信モデルは凍結。受信に fused KV を注入し target の LM 損失を最小化 → fuser のみ更新。
-  Codex指摘の通り、真の異種信頼性は「W がアーキ間の意味的KV対応を学習するか」に懸かる
-  → 多様データ＋held-out で shuffled≫learned（share内容を本当に使う）を確認する。
+Integrate all the prior parts into a single trainable torch module:
+  - heterogeneous projections W_k/W_v: [H_s*hd_s -> H_r*hd_r] (absorb & learn GQA/head/dim mismatch)
+  - RoPE-aware K path: unrotate(sharer inv_freq, sharer positions) -> gather -> project -> receiver RoPE(receiver inv_freq, receiver positions)
+  - V path: gather -> project (no rotation)
+  - per-layer Gumbel-sigmoid gate
+Training: the sharer/receiver models are frozen. Inject the fused KV into the receiver and minimize the target's LM loss -> update only the fuser.
+  As Codex noted, true heterogeneous reliability hinges on "whether W learns the semantic KV correspondence across architectures"
+  -> with diverse data + held-out, confirm shuffled >> learned (it really uses the share content).
 
-検証:
-  python -m trinity.c2c_fuser_hetero --selftest   # 合成: 異種形状＋RoPE-aware＋勾配貫通＋学習（DL不要）
-  python -m trinity.c2c_fuser_hetero --real        # 実機 self-C2C 学習＋held-out汎化アブレーション
+Validation:
+  python -m trinity.c2c_fuser_hetero --selftest   # synthetic: heterogeneous shapes + RoPE-aware + gradient flow + training (no download)
+  python -m trinity.c2c_fuser_hetero --real        # real self-C2C training + held-out generalization ablation
 """
 import sys
 import math
@@ -26,7 +26,7 @@ from trinity.c2c_hetero import char_span_align
 
 
 # ============================================================
-# torch RoPE（trinity_c2c_rope の numpy 版と同規約・微分可能）
+# torch RoPE (same convention as the numpy version in trinity_c2c_rope, differentiable)
 # ============================================================
 def t_rope_cos_sin(positions, inv_freq):
     pos = torch.as_tensor(positions, dtype=torch.float32)
@@ -49,7 +49,7 @@ def t_unapply_rope(x, cos, sin):
 
 
 # ============================================================
-# 統合モジュール: 異種 ＋ RoPE-aware ＋ 学習可能
+# Integrated module: heterogeneous + RoPE-aware + trainable
 # ============================================================
 class TorchHeteroRoPEFuser(nn.Module):
     def __init__(self, sharer: KVShape, receiver: KVShape, sharer_inv_freq, recv_inv_freq,
@@ -80,8 +80,8 @@ class TorchHeteroRoPEFuser(nn.Module):
         return (X.transpose(0, 1).reshape(L, -1) @ W).reshape(L, self.Hr, self.hdr).transpose(0, 1)
 
     def fuse(self, recv_layers, shareK_stored, shareV, sharer_positions, gather_idx, receiver_positions):
-        """recv_layers: list[(K,V)] 受信(凍結)。shareK_stored/shareV: list[K]/list[V] 送信(凍結, Kは回転済み)。
-        返り値: list[(K,V)] 融合済み（fuserパラメータに対し微分可能）。"""
+        """recv_layers: list[(K,V)] receiver (frozen). shareK_stored/shareV: list[K]/list[V] sharer (frozen, K is rotated).
+        Return: list[(K,V)] fused (differentiable w.r.t. the fuser parameters)."""
         g = self.gates()
         cs, ss = t_rope_cos_sin(sharer_positions, self.sh_inv)
         cr, sr = t_rope_cos_sin(receiver_positions, self.rc_inv)
@@ -91,9 +91,9 @@ class TorchHeteroRoPEFuser(nn.Module):
             s = self.align.get(i)
             if s is None or str(i) not in self.Wk:
                 out.append((Kr, Vr)); continue
-            K_unrot = t_unapply_rope(shareK_stored[s], cs, ss)[:, idx, :]      # 未回転→受信位置へgather
-            Kp = t_apply_rope(self._proj(K_unrot, self.Wk[str(i)]), cr, sr)    # 射影→受信RoPE
-            Vp = self._proj(shareV[s][:, idx, :], self.Wv[str(i)])             # Vは回転なし
+            K_unrot = t_unapply_rope(shareK_stored[s], cs, ss)[:, idx, :]      # un-rotate -> gather to receiver positions
+            Kp = t_apply_rope(self._proj(K_unrot, self.Wk[str(i)]), cr, sr)    # project -> receiver RoPE
+            Vp = self._proj(shareV[s][:, idx, :], self.Wv[str(i)])             # V is not rotated
             L = min(Kr.shape[1], Kp.shape[1])
             gi = g[i]
             Kf = torch.cat([(1 - gi) * Kr[:, :L] + gi * Kp[:, :L], Kr[:, L:]], dim=1)
@@ -103,17 +103,17 @@ class TorchHeteroRoPEFuser(nn.Module):
 
 
 # ============================================================
-# selftest（合成・DL不要）: 異種形状＋RoPE-aware＋勾配＋学習
+# selftest (synthetic, no download): heterogeneous shapes + RoPE-aware + gradients + training
 # ============================================================
 def selftest():
     torch.manual_seed(0)
-    sh, rh = KVShape(4, 4, 8), KVShape(3, 2, 16)                 # 送信/受信で 層数・ヘッド・次元すべて異なる
+    sh, rh = KVShape(4, 4, 8), KVShape(3, 2, 16)                 # layers, heads, and dims all differ between sharer/receiver
     sh_inv = rope_inv_freq(8, 10000.0)
-    rc_inv = rope_inv_freq(16, 1e6)                              # baseも異なる
+    rc_inv = rope_inv_freq(16, 1e6)                              # base also differs
     fuser = TorchHeteroRoPEFuser(sh, rh, sh_inv, rc_inv, init_gate=0.05)
 
     Ls, Lr = 7, 5
-    sp, rp, idx = list(range(Ls)), list(range(10, 10 + Lr)), list(range(Lr))   # 位置シフト＋gather
+    sp, rp, idx = list(range(Ls)), list(range(10, 10 + Lr)), list(range(Lr))   # position shift + gather
     recv = [(torch.randn(2, Lr, 16), torch.randn(2, Lr, 16)) for _ in range(3)]
     shK = [torch.randn(4, Ls, 8) for _ in range(4)]
     shV = [torch.randn(4, Ls, 8) for _ in range(4)]
@@ -129,18 +129,18 @@ def selftest():
         opt.zero_grad(); loss.backward(); opt.step()
         losses.append(loss.item())
 
-    assert fused[0][0].shape == (2, Lr, 16), fused[0][0].shape       # 受信形状(H2,hd16)を維持＝異種吸収
+    assert fused[0][0].shape == (2, Lr, 16), fused[0][0].shape       # preserves receiver shape (H2,hd16) = heterogeneous absorption
     assert losses[-1] < losses[0] * 0.6, f"{losses[0]:.3f}->{losses[-1]:.3f}"
     for nm, p in [("Wk2", fuser.Wk["2"]), ("Wv2", fuser.Wv["2"]), ("gate", fuser.gate_logit)]:
         assert p.grad is not None and torch.isfinite(p.grad).all(), f"grad missing: {nm}"
-    print(f"[selftest] 異種形状(L4→3,H4→2,hd8→16,base違い)を吸収・受信形状維持 OK")
-    print(f"[selftest] RoPE-aware経路＋勾配が Wk/Wv/gate に貫通 OK")
-    print(f"[selftest] 学習で loss {losses[0]:.3f}->{losses[-1]:.3f} OK")
+    print(f"[selftest] absorbs heterogeneous shapes (L4->3, H4->2, hd8->16, different base), preserves receiver shape OK")
+    print(f"[selftest] RoPE-aware path + gradients flow through to Wk/Wv/gate OK")
+    print(f"[selftest] training reduces loss {losses[0]:.3f}->{losses[-1]:.3f} OK")
     print("[selftest] ALL PASSED")
 
 
 # ============================================================
-# real（実機 self-C2C 学習＋held-out汎化アブレーション）
+# real (real self-C2C training + held-out generalization ablation)
 # ============================================================
 def real():
     try:
@@ -149,7 +149,7 @@ def real():
         pass
     from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
     name = "Qwen/Qwen2.5-0.5B-Instruct"
-    print(f"[real] load {name} (frozen) …")
+    print(f"[real] load {name} (frozen) ...")
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32, attn_implementation="eager").eval()
     for p in model.parameters():
@@ -160,7 +160,7 @@ def real():
     inv = inv_freq_from_model(model)
     shape = KVShape(cfg.num_hidden_layers, n_kv, hd)
 
-    def enc(text):                                              # 凍結エンコード（定数）
+    def enc(text):                                              # frozen encoding (constant)
         ids = tok(text, return_tensors="pt")["input_ids"]
         with torch.no_grad():
             pkv = model(input_ids=ids, use_cache=True).past_key_values
@@ -169,14 +169,14 @@ def real():
         off = tok(text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
         return K, V, ids, off
 
-    RECV = "Country: Japan.\nThe capital city is"               # 受信は固定（neutral baseline）
+    RECV = "Country: Japan.\nThe capital city is"               # receiver is fixed (neutral baseline)
     rK, rV, r_ids, r_off = enc(RECV)
     Lr = r_ids.shape[1]
     recv_layers = [(rK[l], rV[l]) for l in range(shape.n_layers)]
 
-    def example(country):                                      # 送信文脈→(shareK,shareV,gather,pos)
+    def example(country):                                      # sharer context -> (shareK, shareV, gather, pos)
         sK, sV, s_ids, s_off = enc(f"Country: {country}.\nThe capital city is")
-        gidx = char_span_align(r_off, s_off)                   # 受信位置→送信位置
+        gidx = char_span_align(r_off, s_off)                   # receiver position -> sharer position
         return sK, sV, list(range(s_ids.shape[1])), gidx, s_ids.shape[1]
 
     def loss_of(fuser, country, capital, sharerK, sharerV, sp, gidx):
@@ -197,7 +197,7 @@ def real():
 
     fuser = TorchHeteroRoPEFuser(shape, shape, inv, inv, init_gate=0.05)
     opt = torch.optim.Adam(fuser.parameters(), lr=0.1)
-    print("[real] self-C2C 学習: {France,Germany,Italy}→首都 で fuser を学習 / Spain は held-out")
+    print("[real] self-C2C training: train the fuser on {France,Germany,Italy} -> capital / Spain is held-out")
     fuser.train()
     for step in range(15):
         opt.zero_grad()
@@ -213,21 +213,21 @@ def real():
         if step % 3 == 0:
             print(f"  step {step:2d} | train loss {loss.item():.3f} | gate {torch.sigmoid(fuser.gate_logit).mean():.3f}")
 
-    # held-out 汎化アブレーション
+    # held-out generalization ablation
     fuser.eval()
     sK, sV, sp, gidx, _ = data["Spain"]
     sK_F, sV_F, sp_F, gidx_F, _ = data["France"]
     with torch.no_grad():
         l_learn = loss_of(fuser, "Spain", " Madrid", sK, sV, sp, gidx).item()
-        l_shuf = loss_of(fuser, "Spain", " Madrid", sK_F, sV_F, sp_F, gidx_F).item()   # 誤share(France)
-        # gate0: 注入なし＝受信のみ
+        l_shuf = loss_of(fuser, "Spain", " Madrid", sK_F, sV_F, sp_F, gidx_F).item()   # wrong share (France)
+        # gate0: no injection = receiver only
         for k in list(fuser.Wk): pass
         gl = fuser.gate_logit.detach().clone(); fuser.gate_logit.data.fill_(-50.0)
         l_gate0 = loss_of(fuser, "Spain", " Madrid", sK, sV, sp, gidx).item()
         fuser.gate_logit.data.copy_(gl)
-    print(f"[held-out Spain→Madrid] -logp: learned(Spain)={l_learn:.2f}  gate0/no-inj={l_gate0:.2f}  shuffled(France)={l_shuf:.2f}")
-    print("  learned≪gate0 → 注入が汎化。 learned≪shuffled → 未知国でも『正しいshare内容』を使用(=真の汎化)。")
-    print("→ 異種fuser(射影W＋RoPE-aware＋ゲート)が凍結LM越しに学習され、held-outで効果を検証できる。")
+    print(f"[held-out Spain->Madrid] -logp: learned(Spain)={l_learn:.2f}  gate0/no-inj={l_gate0:.2f}  shuffled(France)={l_shuf:.2f}")
+    print("  learned << gate0 -> injection generalizes. learned << shuffled -> uses the 'correct share content' even for unseen countries (= true generalization).")
+    print("-> the heterogeneous fuser (projection W + RoPE-aware + gate) is trained through the frozen LM, and its effect can be validated on held-out.")
 
 
 if __name__ == "__main__":

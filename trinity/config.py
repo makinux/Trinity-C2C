@@ -1,10 +1,10 @@
 """
-trinity/config.py — config.yml ローダ（デフォルト内蔵・堅牢）
+trinity/config.py — config.yml loader (built-in defaults, robust)
 ============================================================
-- 既定では ./config.yml を読む（環境変数 TRINITY_CONFIG で別パス）。
-- config.yml や pyyaml が無くても DEFAULTS で動作（セルフテストは設定不要）。
-- *_URL 環境変数で base_url を上書き（後方互換）。
-使い方:
+- By default reads ./config.yml (TRINITY_CONFIG env var for a different path).
+- Works via DEFAULTS even without config.yml or pyyaml (self-tests need no config).
+- *_URL env vars override base_url (backward compatible).
+Usage:
   from trinity.config import CONFIG, get
   CONFIG["models"]["worker"]["model_id"]
   get("orchestration", "max_turns", 5)
@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 import os
 
-# config.yml と同一構造の既定値（ファイル/yaml が無くてもこの値で動く）
+# Defaults with the same structure as config.yml (works on these values even without the file/yaml)
 DEFAULTS = {
     "models": {
         "thinker":  {"name": "GLM",          "base_url": "http://localhost:8001/v1", "model_id": "glm-4",
@@ -25,10 +25,10 @@ DEFAULTS = {
                      "api_key": "EMPTY", "temperature": 0.6, "max_tokens": 4096},
     },
     "prompts": {
-        "thinker": "あなたはThinker。問題を分析し、高レベルの計画・分解・既存解への批評のみを返す。コードや最終解は書かない。",
-        "worker": "あなたはWorker。これまでの計画と批評を踏まえ、最終解（完全なコード/導出/数値）を具体的に作る。",
-        "verifier": ("あなたはVerifier。最新のWorker成果物がクエリを正しく・完全に満たすか点検する。"
-                     "最終行に必ず 'VERDICT: ACCEPT' か 'VERDICT: REVISE' を出力。REVISEなら具体的修正点も述べる。"),
+        "thinker": "You are the Thinker. Analyze the problem and return only high-level plans, decompositions, and critiques of existing solutions. Do not write code or the final solution.",
+        "worker": "You are the Worker. Building on the plans and critiques so far, produce the concrete final solution (complete code/derivation/numbers).",
+        "verifier": ("You are the Verifier. Check whether the latest Worker artifact correctly and completely satisfies the query. "
+                     "Always output 'VERDICT: ACCEPT' or 'VERDICT: REVISE' on the last line. If REVISE, also state the specific fixes."),
     },
     "orchestration": {"max_turns": 5, "verbose": True},
     "coordinator": {"slm_model": "Qwen/Qwen3-0.6B", "featurizer": "qwen3", "mask_no_artifact": True},
@@ -58,13 +58,13 @@ def load_config(path: str | None = None) -> dict:
             with open(p, encoding="utf-8") as f:
                 user = yaml.safe_load(f) or {}
             cfg = _deep_merge(cfg, user)
-        except Exception as e:                          # pyyaml無し/パース失敗 → 既定で続行
-            print(f"[config] {p} 読み込み失敗、デフォルト使用: {e}")
-    # *_URL 環境変数で base_url を上書き（後方互換）
+        except Exception as e:                          # no pyyaml / parse failure -> continue with defaults
+            print(f"[config] failed to load {p}, using defaults: {e}")
+    # Override base_url via *_URL env vars (backward compatible)
     for role, env in (("thinker", "THINKER_URL"), ("worker", "WORKER_URL"), ("verifier", "VERIFIER_URL")):
         if os.getenv(env):
             cfg["models"][role]["base_url"] = os.environ[env]
-    # 秘密鍵は <ROLE>_API_KEY 環境変数を優先（YAML平文を避ける推奨運用）
+    # Prefer the <ROLE>_API_KEY env var for secrets (recommended; avoids plaintext YAML)
     for role in cfg.get("models", {}):
         key = os.getenv(f"{role.upper()}_API_KEY")
         if key:

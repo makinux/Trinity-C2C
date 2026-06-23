@@ -1,12 +1,12 @@
 """
-学習コーディネータ骨子 (1/2): 特徴量化 + 線形ヘッド + LearnedCoordinator
+Learned coordinator skeleton (1/2): featurization + linear head + LearnedCoordinator
 =====================================================================
-Trinity準拠:
-  - 小型SLM(Qwen3-0.6B, 凍結)が state(transcript) を符号化 → penultimateトークンの隠れ状態 h∈R^d
-  - 極小の線形ヘッド θ(数千params) が h → 役割ロジット
-  - star設計ではモデルは役割固定なので、ヘッドは「次の役割」を選ぶ(|A|=3)
-  - 終了は Verifier の ACCEPT でループ側が判定（P0と同じ）
-θ は sep-CMA-ES(trinity/train.py)で最適化する。
+Trinity-style:
+  - a small SLM (Qwen3-0.6B, frozen) encodes the state (transcript) -> hidden state of the penultimate token h in R^d
+  - a tiny linear head theta (a few thousand params) maps h -> role logits
+  - in the star design the model is fixed per role, so the head picks the "next role" (|A|=3)
+  - termination is decided by the loop on the Verifier's ACCEPT (same as P0)
+theta is optimized by sep-CMA-ES (trinity/train.py).
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def softmax(z: np.ndarray) -> np.ndarray:
 
 
 # ============================================================
-# 特徴量化: state -> h ∈ R^d
+# Featurization: state -> h in R^d
 # ============================================================
 class Featurizer:
     dim: int
@@ -38,7 +38,7 @@ class Featurizer:
 
 
 class MockFeaturizer(Featurizer):
-    """SLM不要のダミー特徴量。transcriptのhashから決定的にd次元ベクトル。配線/学習テスト用。"""
+    """Dummy features with no SLM. A deterministic d-dim vector from the transcript hash. For wiring/training tests."""
     def __init__(self, dim: int = 32):
         self.dim = dim
 
@@ -49,7 +49,7 @@ class MockFeaturizer(Featurizer):
 
 
 class Qwen3HiddenStateFeaturizer(Featurizer):
-    """本番: Qwen3-0.6B の penultimate トークン隠れ状態（設計どおり）。transformers/torch使用（重い）。"""
+    """Production: the penultimate-token hidden state of Qwen3-0.6B (as designed). Uses transformers/torch (heavy)."""
     def __init__(self, model_name: str = "Qwen/Qwen3-0.6B", device: str = "cuda", max_len: int = 4096):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -69,12 +69,12 @@ class Qwen3HiddenStateFeaturizer(Featurizer):
         with torch.no_grad():
             out = self.model(**ids)
         seq = out.hidden_states[-1][0]           # [seq_len, dim]
-        pos = -2 if seq.shape[0] >= 2 else -1    # penultimate（短すぎる時は最終）
+        pos = -2 if seq.shape[0] >= 2 else -1    # penultimate (use the last token when too short)
         return seq[pos, :].float().cpu().numpy()
 
 
 # ============================================================
-# 線形ヘッド θ: R^d -> 役割ロジット
+# Linear head theta: R^d -> role logits
 # ============================================================
 @dataclass
 class LinearHead:
@@ -93,7 +93,7 @@ class LinearHead:
 
 
 # ============================================================
-# 学習コーディネータ（θを差し替えるだけで方策が変わる）
+# Learned coordinator (swapping theta alone changes the policy)
 # ============================================================
 class LearnedCoordinator(Coordinator):
     def __init__(self, featurizer: Featurizer, head: LinearHead, theta: np.ndarray,
@@ -109,7 +109,7 @@ class LearnedCoordinator(Coordinator):
     def decide(self, state: State) -> Optional[Action]:
         logits = self.head.logits(self.theta, self.f.encode(state)).astype(float)
         if self.mask_no_artifact and state.artifact is None:
-            logits[ROLE_ACTIONS.index(Role.VERIFIER)] = -1e30   # 成果物前のVerifyを禁止(軽い構造事前)
+            logits[ROLE_ACTIONS.index(Role.VERIFIER)] = -1e30   # forbid Verify before an artifact exists (a light structural prior)
         a = int(np.argmax(logits)) if self.greedy else int(self.rng.choice(N_ACTIONS, p=softmax(logits)))
         role = ROLE_ACTIONS[a]
         return Action(role, ROLE_TO_KEY[role])

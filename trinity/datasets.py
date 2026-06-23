@@ -1,20 +1,20 @@
 """
-trinity/datasets.py — HumanEval+ / MBPP+ ローダ
+trinity/datasets.py — HumanEval+ / MBPP+ loader
 ================================================
-EvalPlus(HumanEval+/MBPP+) の問題を trinity_eval.CodingTask に変換する。
-採点は「候補解 vs 参照解(canonical) の差分テスト(differential testing)」を
-自己完結した assert 列に変換し、既存の run_unit_test(code, test) で実行する
-（EvalPlus流の入力ベース検証：base_input + plus_input の全入力で出力一致を確認）。
+Converts EvalPlus (HumanEval+/MBPP+) problems into trinity_eval.CodingTask.
+Scoring turns "differential testing of the candidate vs the reference (canonical) solution"
+into a self-contained sequence of asserts, run via the existing run_unit_test(code, test)
+(EvalPlus-style input-based checking: confirm output agreement over all of base_input + plus_input).
 
-依存: pip install evalplus
-使い方(コードから):
+Depends: pip install evalplus
+Usage (from code):
     from trinity.datasets import load_humaneval_plus
     from trinity.eval import bench
-    tasks = load_humaneval_plus(limit=20)     # 20問
+    tasks = load_humaneval_plus(limit=20)     # 20 problems
     bench(tasks=tasks, trials=1, ...)
 CLI:
-    python -m trinity.datasets --selftest                      # evalplus不要。差分テスト機構の検証
-    python -m trinity.datasets --source humaneval --limit 10   # 実データの読み込み確認
+    python -m trinity.datasets --selftest                      # no evalplus. checks the differential-test machinery
+    python -m trinity.datasets --source humaneval --limit 10   # confirm loading of real data
 """
 from __future__ import annotations
 
@@ -29,8 +29,9 @@ from trinity.eval import CodingTask
 # problem(dict) -> CodingTask
 # ============================================================
 def _ref_src(problem: dict) -> str:
-    """参照解の完全ソース。canonicalがentry_pointをトップレベル定義済みならそれ、無ければ prompt+canonical。
-    （HumanEval+ の canonical_solution は通常「補完」なので prompt 前置が必要。AST で厳密判定）。"""
+    """Full source of the reference solution. If canonical already defines entry_point at top level, use it;
+    otherwise prompt+canonical. (HumanEval+'s canonical_solution is usually a "completion", so the prompt must be
+    prepended. Decided strictly via AST.)"""
     cs = problem["canonical_solution"]
     ep = problem["entry_point"]
     try:
@@ -51,7 +52,8 @@ def _get_inputs(problem: dict, max_inputs: Optional[int]):
 
 
 def _diff_test(entry_point: str, ref_src: str, inputs: list, atol: float = 0.0) -> str:
-    """候補(code側でentry_pointを定義) と 参照(別名前空間) の出力一致を全入力で検証するassert列。"""
+    """A sequence of asserts checking output agreement between the candidate (entry_point defined on the code side)
+    and the reference (in a separate namespace) over all inputs."""
     return (
         "import copy as _c\n"
         "_ns = {}\n"
@@ -73,20 +75,20 @@ def _problem_to_task(problem: dict, source: str, max_inputs: Optional[int]) -> C
     ep = problem["entry_point"]
     inputs, capped, n_base, n_plus = _get_inputs(problem, max_inputs)
     if source == "humaneval":
-        query = f"次の関数を完成させ、完全な実装をPythonコードで返せ。\n\n{problem['prompt']}"
+        query = f"Complete the following function and return the full implementation as Python code.\n\n{problem['prompt']}"
     else:  # mbpp
-        query = f"次の仕様を満たす関数 `{ep}` をPythonで実装せよ。\n\n{problem['prompt']}"
+        query = f"Implement a Python function `{ep}` that satisfies the following spec.\n\n{problem['prompt']}"
     test = _diff_test(ep, _ref_src(problem), inputs, float(problem.get("atol", 0) or 0))
     name = str(problem["task_id"]).replace("/", "_")
     if capped:
-        print(f"[load] {name}: inputs capped to {max_inputs} (base={n_base}, plus={n_plus})  ※coverage削減")
+        print(f"[load] {name}: inputs capped to {max_inputs} (base={n_base}, plus={n_plus})  (reduced coverage)")
     return CodingTask(name, query, test)
 
 
 # ============================================================
-# ローダ（evalplus 必須）
+# Loaders (evalplus required)
 # ============================================================
-# max_inputs=None: 全入力で採点（EvalPlus忠実）。速度のため減らす時のみ指定→capをログ警告。
+# max_inputs=None: score over all inputs (EvalPlus-faithful). Set it only to reduce for speed -> logs a cap warning.
 def load_humaneval_plus(limit: Optional[int] = None, max_inputs: Optional[int] = None) -> list[CodingTask]:
     from evalplus.data import get_human_eval_plus
     probs = list(get_human_eval_plus().values())
@@ -104,14 +106,14 @@ def load_mbpp_plus(limit: Optional[int] = None, max_inputs: Optional[int] = None
 
 
 # ============================================================
-# セルフテスト（evalplus不要：合成problemで差分テスト機構を検証）
+# Self-test (no evalplus: validate the differential-test machinery with a synthetic problem)
 # ============================================================
 def selftest() -> None:
     from trinity.eval import make_scorer
     prob = {
         "task_id": "Synthetic/0",
         "entry_point": "add_one",
-        "prompt": "def add_one(x):\n    \"\"\"x に 1 を足す\"\"\"\n",
+        "prompt": "def add_one(x):\n    \"\"\"add 1 to x\"\"\"\n",
         "canonical_solution": "def add_one(x):\n    return x + 1\n",
         "base_input": [[0], [5]],
         "plus_input": [[-3], [100]],
@@ -122,9 +124,9 @@ def selftest() -> None:
 
     good = "```python\ndef add_one(x):\n    return x + 1\n```"
     bad = "```python\ndef add_one(x):\n    return x + 2\n```"
-    assert sc(good) is True, "正解がPASSしない"
-    assert sc(bad) is False, "バグありがfailしない"
-    print("[selftest] differential test OK : 正解=PASS / バグあり=fail")
+    assert sc(good) is True, "correct solution does not PASS"
+    assert sc(bad) is False, "buggy solution does not fail"
+    print("[selftest] differential test OK : correct=PASS / buggy=fail")
 
     assert sc("```python\n" + prob["canonical_solution"] + "```") is True
     print("[selftest] canonical passes its own oracle")
@@ -145,4 +147,4 @@ if __name__ == "__main__":
         loader = load_humaneval_plus if source == "humaneval" else load_mbpp_plus
         tasks = loader(limit=limit)
         print(f"loaded {len(tasks)} tasks from {source}+ (limit={limit})")
-        print("例:", tasks[0].name if tasks else "(none)")
+        print("e.g.:", tasks[0].name if tasks else "(none)")
