@@ -1,0 +1,11 @@
+# Dependencies for the C2C-enabled gateway (trinity.gateway with the in-process KV-fusion
+# backend). This is the lightweight gateway stack PLUS transformers, so InProcessLM / C2CEngine
+# can load the small models in-process. torch (CPU build) is installed separately in
+# Dockerfile.gateway.c2c from the PyTorch CPU index (it is not on PyPI for all platforms).
+fastapi>=0.110
+uvicorn[standard]>=0.29
+openai>=1.0
+pyyaml>=6.0
+transformers>=5.0,<6
+safetensors>=0.4
+truststore>=0.9

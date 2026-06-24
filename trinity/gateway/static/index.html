@@ -31,7 +31,9 @@
         <div class="controls-row">
           <div class="opts">
             <label class="switch"><input type="checkbox" id="mock" checked /> <span>Mock mode (offline)</span></label>
+            <label class="switch" title="Run the in-process Cache-to-Cache KV-fusion backend (needs the C2C gateway image / local torch). Overrides mock."><input type="checkbox" id="c2c" /> <span>C2C (KV fusion)</span></label>
             <label class="switch"><input type="checkbox" id="prompts" checked /> <span>Show prompts</span></label>
+            <label class="num" title="C2C fusion gate 0..1 (0 = Worker alone; the untrained fuser degrades quality as the gate rises)">gate <input type="number" id="c2c-gate" min="0" max="1" step="0.05" value="0" /></label>
             <label class="num">max_turns <input type="number" id="max-turns" min="1" max="20" value="5" /></label>
             <label class="num">mock delay <input type="number" id="mock-delay" min="0" max="5" step="0.1" value="0.4" /> s</label>
           </div>

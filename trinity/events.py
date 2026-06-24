@@ -19,6 +19,8 @@ type            when                         payload fields (besides the common 
 ``decision``    Coordinator chose an action  step, role, model_key, meta, state_turns,
                 (or decided to stop)         artifact_chars, reason
 ``turn_start``  a role is about to run       step, role, model_key, model_name, system, user
+``fusion``      a C2C KV edge was applied    step, role, sharer_model, receiver_model, gate,
+                (Thinker -> Worker, C2C mode) aligned_layers, share_len, recv_len, new_tokens
 ``turn_end``    a role finished              step, role, model_key, model_name, output,
                                              output_chars, duration_ms, artifact_chars,
                                              state_turns
@@ -43,6 +45,7 @@ EventCallback = Callable[[Event], None]
 RUN_START = "run_start"
 DECISION = "decision"
 TURN_START = "turn_start"
+FUSION = "fusion"          # C2C mode only: the Thinker->Worker KV-fusion edge (gate, alignment)
 TURN_END = "turn_end"
 VERDICT = "verdict"
 ERROR = "error"

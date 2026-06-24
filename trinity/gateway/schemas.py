@@ -25,9 +25,11 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
 
     # --- Trinity extras (pass via extra_body={...}) ---
-    trinity_mock: Optional[bool] = None      # force mock backend on/off (default: env)
-    trinity_trace: Optional[bool] = None     # include the full workflow trace in the response
-    trinity_max_turns: Optional[int] = None  # override orchestration.max_turns
+    trinity_mock: Optional[bool] = None       # force mock backend on/off (default: env)
+    trinity_c2c: Optional[bool] = None        # force the in-process C2C KV-fusion backend (default: env)
+    trinity_trace: Optional[bool] = None      # include the full workflow trace in the response
+    trinity_max_turns: Optional[int] = None   # override orchestration.max_turns
+    trinity_c2c_gate: Optional[float] = None  # C2C mode only: override the fusion gate (0..1)
 
 
 class DebugRunRequest(BaseModel):
@@ -36,5 +38,7 @@ class DebugRunRequest(BaseModel):
     query: str = ""
     max_turns: Optional[int] = None
     mock: bool = True               # default ON so the UI works fully offline
+    c2c: bool = False               # run the in-process C2C KV-fusion backend (overrides mock)
+    gate: Optional[float] = None    # C2C mode only: override the fusion gate (0..1)
     mock_delay: float = 0.4         # per-turn delay so the live trace is visibly progressive
     include_prompts: bool = True    # include each role's system+user prompt in turn_start

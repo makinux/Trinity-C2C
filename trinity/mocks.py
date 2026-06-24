@@ -120,3 +120,65 @@ def build_mock_pool(delay_s: float = 0.4) -> dict[str, ChatModel]:
         "worker": MockModel("Mock-Worker (Qwen3-Coder)", Role.WORKER, delay_s),
         "verifier": MockModel("Mock-Verifier (DeepSeek-R1)", Role.VERIFIER, delay_s),
     }
+
+
+@dataclass
+class MockC2CEngine:
+    """Model-free stand-in for :class:`trinity.c2c_edge.C2CEngine`.
+
+    Lets :func:`trinity.p1.run_c2c` (and the gateway's ``c2c`` mode) be exercised end-to-end with
+    no torch and no model downloads — it implements exactly the engine surface ``run_c2c`` uses:
+    ``sharer_name`` / ``receiver_name`` / ``gate`` / ``set_gate`` / ``sharer_chat`` /
+    ``receiver_chat`` / ``c2c_edge``. ``c2c_edge`` returns the same ``(text, meta_dict)`` shape as
+    the real engine so the ``fusion`` event payload is identical in structure. Like
+    :class:`MockModel` it forces one REVISE -> ACCEPT cycle so the full loop is visible.
+    """
+    sharer_name: str = "Mock-Sharer (SmolLM)"
+    receiver_name: str = "Mock-Receiver (Qwen)"
+    gate: float = 0.05
+    delay_s: float = 0.0
+    aligned_layers: int = 24
+    _verifier_calls: int = field(default=0, init=False)
+
+    def set_gate(self, value: float) -> None:
+        self.gate = float(value)
+
+    def _sleep(self) -> None:
+        if self.delay_s > 0:
+            time.sleep(self.delay_s)
+
+    def sharer_chat(self, system: str, user: str) -> str:
+        self._sleep()
+        return ("[MOCK Thinker plan]\n1. Restate the goal and requirements.\n"
+                "2. Decompose: input handling, core loop, edge cases, complexity.\n"
+                "(offline mock C2C engine -- the latent plan would ride the KV channel)")
+
+    def receiver_chat(self, system: str, user: str) -> str:
+        # Used as the default Verifier: REVISE once, then ACCEPT (shows the whole loop).
+        self._sleep()
+        self._verifier_calls += 1
+        if self._verifier_calls == 1:
+            return ("[MOCK Verifier review]\nThe core is right but empty inputs are unhandled.\n"
+                    "VERDICT: REVISE")
+        return ("[MOCK Verifier review]\nNow handles empty inputs and states O(n+m).\n"
+                "VERDICT: ACCEPT")
+
+    def c2c_edge(self, share_text: str, recv_text: str, gen_prompt: str,
+                 should_stop=None) -> tuple[str, dict]:
+        self._sleep()
+        tag = "v2 (incorporates the Verifier's fix)" if self._verifier_calls else "v1"
+        artifact = (f"[MOCK Worker artifact {tag} via C2C edge]\n```python\n"
+                    "def solve(a, b):\n    return sorted(a + b)\n```\nTime complexity: O(n+m).")
+        approx = max(1, len(recv_text) // 4)
+        meta = {
+            "gate": round(float(self.gate), 4), "aligned_layers": self.aligned_layers,
+            "share_len": approx, "recv_len": approx,
+            "sharer_model": self.sharer_name, "receiver_model": self.receiver_name,
+            "new_tokens": 24,
+        }
+        return artifact, meta
+
+
+def build_mock_c2c_engine(delay_s: float = 0.0) -> MockC2CEngine:
+    """A **fresh** model-free C2C engine (per-instance REVISE/ACCEPT counter must not leak)."""
+    return MockC2CEngine(delay_s=delay_s)
