@@ -164,7 +164,9 @@ class MockC2CEngine:
                 "VERDICT: ACCEPT")
 
     def c2c_edge(self, share_text: str, recv_text: str, gen_prompt: str,
-                 should_stop=None) -> tuple[str, dict]:
+                 gate=None, should_stop=None) -> tuple[str, dict]:
+        if gate is not None:
+            self.set_gate(gate)
         self._sleep()
         tag = "v2 (incorporates the Verifier's fix)" if self._verifier_calls else "v1"
         artifact = (f"[MOCK Worker artifact {tag} via C2C edge]\n```python\n"
@@ -174,7 +176,7 @@ class MockC2CEngine:
             "gate": round(float(self.gate), 4), "aligned_layers": self.aligned_layers,
             "share_len": approx, "recv_len": approx,
             "sharer_model": self.sharer_name, "receiver_model": self.receiver_name,
-            "new_tokens": 24,
+            "new_tokens": 24, "fuser": "mock",
         }
         return artifact, meta
 

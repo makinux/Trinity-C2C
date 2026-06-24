@@ -80,6 +80,7 @@ services:
       TRINITY_C2C: "1"
       TRINITY_C2C_GATE: ${TRINITY_C2C_GATE:-}                 # default = config.yml c2c.init_gate (0.05)
       TRINITY_C2C_MAX_NEW_TOKENS: ${TRINITY_C2C_MAX_NEW_TOKENS:-256}
+      TRINITY_C2C_FUSER: ${TRINITY_C2C_FUSER:-}               # trained fuser checkpoint, e.g. /app/checkpoints/distill.pt
       HF_HOME: /hf-cache
       HF_TOKEN: ${HF_TOKEN:-}
       SHARER_MODEL_ID: ${SHARER_MODEL_ID:-}                   # override the Thinker(sharer) model tag
@@ -88,6 +89,7 @@ services:
       - "${GATEWAY_C2C_PORT:-8080}:8080"                      # set GATEWAY_C2C_PORT to avoid the 8080 clash
     volumes:
       - hf-cache:/hf-cache                                    # persist downloaded models across runs
+      - ./checkpoints:/app/checkpoints:ro                     # trained fuser checkpoints (set TRINITY_C2C_FUSER above)
     healthcheck:   # /healthz is cheap (no model load); the engine loads lazily on the first C2C run
       test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8080/healthz')\" || exit 1"]
       interval: 15s

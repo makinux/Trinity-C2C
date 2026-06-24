@@ -14,6 +14,8 @@ Validation:
   python -m trinity.c2c_fuser_hetero --selftest   # synthetic: heterogeneous shapes + RoPE-aware + gradient flow + training (no download)
   python -m trinity.c2c_fuser_hetero --real        # real self-C2C training + held-out generalization ablation
 """
+import hashlib
+import os
 import sys
 import math
 import numpy as np
@@ -103,6 +105,87 @@ class TorchHeteroRoPEFuser(nn.Module):
 
 
 # ============================================================
+# Checkpoints: persist a trained fuser and load it back with compatibility validation
+#   A fuser is tied to a specific (sharer, receiver) pair — head/dim/layer shapes AND the
+#   per-model RoPE inv_freq. Loading a mismatched checkpoint would silently corrupt generation,
+#   so load_fuser_into() validates model ids, head/dim shapes, and inv_freq hashes, then does a
+#   strict state_dict load (which also enforces layer count + Wk/Wv tensor shapes). On any
+#   mismatch it raises CheckpointMismatch so the caller can fall back to the safe untrained path.
+# ============================================================
+CHECKPOINT_FORMAT_VERSION = 1
+
+
+class CheckpointMismatch(Exception):
+    """A fuser checkpoint is incompatible with the target (sharer/receiver) configuration."""
+
+
+def _inv_freq_hash(t: torch.Tensor) -> str:
+    return hashlib.sha256(t.detach().cpu().to(torch.float32).numpy().tobytes()).hexdigest()[:16]
+
+
+def save_fuser(fuser: "TorchHeteroRoPEFuser", path: str, *, sharer_model: str, receiver_model: str,
+               sharer_shape: KVShape, receiver_shape: KVShape, metadata: dict | None = None) -> str:
+    """Save a trained fuser + the metadata load_fuser_into() needs to validate compatibility."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    ckpt = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "fuser_class": "TorchHeteroRoPEFuser",
+        "sharer_model": sharer_model,
+        "receiver_model": receiver_model,
+        "sharer_shape": [sharer_shape.n_layers, sharer_shape.n_heads, sharer_shape.head_dim],
+        "receiver_shape": [receiver_shape.n_layers, receiver_shape.n_heads, receiver_shape.head_dim],
+        "tau": float(fuser.tau),
+        "sh_inv_hash": _inv_freq_hash(fuser.sh_inv),
+        "rc_inv_hash": _inv_freq_hash(fuser.rc_inv),
+        "state_dict": fuser.state_dict(),
+        "training": metadata or {},
+    }
+    torch.save(ckpt, path)
+    return path
+
+
+def load_fuser_into(fuser: "TorchHeteroRoPEFuser", path: str, *,
+                    expect_sharer_model: str | None = None, expect_receiver_model: str | None = None,
+                    map_location="cpu") -> dict:
+    """Validate a checkpoint against ``fuser`` and (strictly) load its weights. Raises
+    CheckpointMismatch on any incompatibility. Returns the checkpoint dict (minus weights use)."""
+    # Our checkpoints carry non-tensor metadata, so weights_only=False is required; these are
+    # local, self-produced files (not untrusted input).
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    if ckpt.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise CheckpointMismatch(
+            f"format_version {ckpt.get('format_version')} != {CHECKPOINT_FORMAT_VERSION}")
+    if ckpt.get("fuser_class") != "TorchHeteroRoPEFuser":
+        raise CheckpointMismatch(f"fuser_class {ckpt.get('fuser_class')!r} unsupported")
+    for label, got, exp in [("sharer_model", ckpt.get("sharer_model"), expect_sharer_model),
+                            ("receiver_model", ckpt.get("receiver_model"), expect_receiver_model)]:
+        if exp is not None and got != exp:
+            raise CheckpointMismatch(f"{label} {got!r} != expected {exp!r}")
+    # head/dim must match (layer count + Wk/Wv shapes are enforced by the strict load below)
+    sh, rh = ckpt.get("sharer_shape") or [None] * 3, ckpt.get("receiver_shape") or [None] * 3
+    if (sh[1], sh[2], rh[1], rh[2]) != (fuser.Hs, fuser.hds, fuser.Hr, fuser.hdr):
+        raise CheckpointMismatch(
+            f"shape (Hs,hds,Hr,hdr) ckpt={(sh[1], sh[2], rh[1], rh[2])} != fuser={(fuser.Hs, fuser.hds, fuser.Hr, fuser.hdr)}")
+    # Validate the inv_freq buffers that will ACTUALLY be loaded (sh_inv/rc_inv live in state_dict),
+    # not just the stored hash fields — a stale/tampered buffer must not overwrite the target's RoPE.
+    sd = ckpt["state_dict"]
+    want = (_inv_freq_hash(fuser.sh_inv), _inv_freq_hash(fuser.rc_inv))
+    got = ((_inv_freq_hash(sd["sh_inv"]), _inv_freq_hash(sd["rc_inv"]))
+           if "sh_inv" in sd and "rc_inv" in sd else (ckpt.get("sh_inv_hash"), ckpt.get("rc_inv_hash")))
+    if want != got:
+        raise CheckpointMismatch("RoPE inv_freq mismatch (checkpoint rotary differs from target model)")
+    # strict load is not atomic, so snapshot first and restore on failure (keep a clean fuser).
+    backup = {k: v.detach().clone() for k, v in fuser.state_dict().items()}
+    try:
+        fuser.load_state_dict(sd, strict=True)
+    except Exception as e:
+        fuser.load_state_dict(backup, strict=True)
+        raise CheckpointMismatch(f"state_dict load failed (fuser restored): {e}") from e
+    return ckpt
+
+
+# ============================================================
 # selftest (synthetic, no download): heterogeneous shapes + RoPE-aware + gradients + training
 # ============================================================
 def selftest():
@@ -136,6 +219,29 @@ def selftest():
     print(f"[selftest] absorbs heterogeneous shapes (L4->3, H4->2, hd8->16, different base), preserves receiver shape OK")
     print(f"[selftest] RoPE-aware path + gradients flow through to Wk/Wv/gate OK")
     print(f"[selftest] training reduces loss {losses[0]:.3f}->{losses[-1]:.3f} OK")
+
+    # checkpoint round-trip: save the trained fuser, load into a fresh one -> weights restored exactly
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ckpt_path = os.path.join(td, "fuser.pt")
+        save_fuser(fuser, ckpt_path, sharer_model="sharer-x", receiver_model="receiver-y",
+                   sharer_shape=sh, receiver_shape=rh, metadata={"objective": "selftest"})
+        fresh = TorchHeteroRoPEFuser(sh, rh, sh_inv, rc_inv, init_gate=0.05)
+        assert not torch.allclose(fresh.Wk["2"], fuser.Wk["2"]), "fresh fuser already equals trained?"
+        load_fuser_into(fresh, ckpt_path, expect_sharer_model="sharer-x", expect_receiver_model="receiver-y")
+        assert all(torch.allclose(fresh.Wk[k], fuser.Wk[k]) and torch.allclose(fresh.Wv[k], fuser.Wv[k])
+                   for k in fuser.Wk) and torch.allclose(fresh.gate_logit, fuser.gate_logit)
+        print("[selftest] checkpoint save/load round-trip OK (weights restored exactly)")
+
+        # validation must reject an incompatible checkpoint (wrong model id, wrong head/dim)
+        for bad in (lambda: load_fuser_into(fresh, ckpt_path, expect_sharer_model="WRONG"),
+                    lambda: load_fuser_into(TorchHeteroRoPEFuser(sh, KVShape(3, 2, 8), sh_inv,
+                                                                 rope_inv_freq(8, 1e6)), ckpt_path)):
+            try:
+                bad(); raise AssertionError("expected CheckpointMismatch")
+            except CheckpointMismatch:
+                pass
+        print("[selftest] checkpoint validation rejects model-id / shape mismatch OK")
     print("[selftest] ALL PASSED")
 
 

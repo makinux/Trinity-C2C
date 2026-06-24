@@ -10,6 +10,7 @@ venv/
 coordinator_theta.npy
 *.output
 *.npy
+checkpoints/        # trained C2C fuser checkpoints (*.pt) — produced by trinity.c2c_train
 
 # OS / editor
 .DS_Store

@@ -39,7 +39,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from trinity.c2c import KVShape
 from trinity.c2c_rope import inv_freq_from_model
 from trinity.c2c_hetero import char_span_align
-from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser
+from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser, load_fuser_into
 from trinity.config import get
 from trinity.p0 import strip_think
 
@@ -97,7 +97,8 @@ class C2CEngine:
     def __init__(self, sharer_model: Optional[str] = None, receiver_model: Optional[str] = None, *,
                  device: str = "cpu", dtype=torch.float32,
                  init_gate: Optional[float] = None, tau: Optional[float] = None,
-                 max_new_tokens: int = 256, max_ctx: int = 4096):
+                 max_new_tokens: int = 256, max_ctx: int = 4096,
+                 fuser_path: Optional[str] = None):
         # precedence: explicit arg > env override > config.yml > built-in default
         self.sharer_name = (sharer_model or os.getenv("SHARER_MODEL_ID")
                             or get("c2c", "sharer_model", "HuggingFaceTB/SmolLM2-135M-Instruct"))
@@ -107,6 +108,7 @@ class C2CEngine:
         self.dtype = dtype
         self.max_new_tokens = int(max_new_tokens)
         self.max_ctx = int(max_ctx)
+        gate_explicit = init_gate is not None      # did the caller pin a uniform gate?
         gate = float(get("c2c", "init_gate", 0.05) if init_gate is None else init_gate)
         tau = float(get("c2c", "tau", 1.0) if tau is None else tau)
 
@@ -120,6 +122,32 @@ class C2CEngine:
         self.fuser.eval()                 # eval => deterministic sigmoid gate (no Gumbel noise)
         self._recv_eos = {i for i in [self.rtok.eos_token_id] if i is not None}
         self.set_gate(gate)               # applies exact 0/1 via saturation; also sets self.gate
+
+        # Optional trained fuser checkpoint. Resolution: arg > TRINITY_C2C_FUSER > config c2c.fuser_path.
+        # On any incompatibility we keep the fresh (untrained) fuser, which is gate-0 safe.
+        self.fuser_path = fuser_path or os.getenv("TRINITY_C2C_FUSER") or get("c2c", "fuser_path", None) or None
+        self.fuser_loaded = False
+        self.fuser_label = "untrained"
+        if self.fuser_path:
+            try:
+                load_fuser_into(self.fuser, self.fuser_path,
+                                expect_sharer_model=self.sharer_name,
+                                expect_receiver_model=self.receiver_name)
+                self.fuser.eval()
+                self.fuser_loaded = True
+                self.fuser_label = f"trained:{os.path.basename(self.fuser_path)}"
+                if gate_explicit:
+                    self.set_gate(gate)   # an explicit gate overrides the checkpoint's learned gates
+                else:
+                    # keep the checkpoint's learned per-layer gates; report their mean for the trace
+                    self.gate = float(torch.sigmoid(self.fuser.gate_logit).mean().detach())
+            except Exception as e:
+                # The user asked for a trained fuser and it failed to load — fall back to gate=0
+                # (receiver-alone, no fusion), which is genuinely non-degrading, rather than an
+                # untrained fuser at a nonzero gate (which would degrade).
+                self.set_gate(0.0)
+                print(f"[C2CEngine] WARNING: could not load fuser checkpoint {self.fuser_path!r}: {e}"
+                      f" -- falling back to gate=0 (receiver-alone, no fusion).")
 
     # -- gate control ------------------------------------------------------
     def set_gate(self, value: float) -> None:
@@ -201,33 +229,43 @@ class C2CEngine:
         receiver KV (length = recv tokens) is the generation prefix; ``gen_prompt`` is appended
         live and the Worker continues from there.
         """
+        # A per-call gate is a TEMPORARY override: save & restore gate_logit / self.gate so it never
+        # clobbers the engine's persistent (e.g. checkpoint-learned per-layer) gates — this engine is
+        # a shared, lock-serialized singleton, so a leaked gate would corrupt later requests.
+        saved = None
         if gate is not None:
+            saved = (self.fuser.gate_logit.detach().clone(), self.gate)
             self.set_gate(gate)
         self.fuser.eval()
         mnt = int(max_new_tokens or self.max_new_tokens)
+        try:
+            sK, sV, s_ids, s_off = _encode(self.sm, self.stok, share_text, self.device, self.max_ctx)
+            rK, rV, r_ids, r_off = _encode(self.rm, self.rtok, recv_text, self.device, self.max_ctx)
+            gidx = char_span_align(r_off, s_off)             # receiver position -> sharer position
+            recv_layers = [(rK[l], rV[l]) for l in range(self.r_shape.n_layers)]
+            sp = list(range(s_ids.shape[1]))
+            rp = list(range(r_ids.shape[1]))
+            with torch.no_grad():
+                fused = self.fuser.fuse(recv_layers, sK, sV, sp, gidx, rp)
 
-        sK, sV, s_ids, s_off = _encode(self.sm, self.stok, share_text, self.device, self.max_ctx)
-        rK, rV, r_ids, r_off = _encode(self.rm, self.rtok, recv_text, self.device, self.max_ctx)
-        gidx = char_span_align(r_off, s_off)                 # receiver position -> sharer position
-        recv_layers = [(rK[l], rV[l]) for l in range(self.r_shape.n_layers)]
-        sp = list(range(s_ids.shape[1]))
-        rp = list(range(r_ids.shape[1]))
-        with torch.no_grad():
-            fused = self.fuser.fuse(recv_layers, sK, sV, sp, gidx, rp)
-
-        past_len = fused[0][0].shape[1]                      # = receiver length
-        cache = self._build_cache(fused)
-        prompt_ids = self.rtok(gen_prompt, return_tensors="pt",
-                               add_special_tokens=False)["input_ids"].to(self.device)
-        gen_ids = self._greedy_from_cache(cache, past_len, prompt_ids, mnt, should_stop=should_stop)
-        text = self.rtok.decode(gen_ids, skip_special_tokens=True).strip()
-        meta = {
-            "gate": round(float(self.gate), 4), "aligned_layers": len(self.fuser.align),
-            "share_len": int(s_ids.shape[1]), "recv_len": int(r_ids.shape[1]),
-            "sharer_model": self.sharer_name, "receiver_model": self.receiver_name,
-            "new_tokens": len(gen_ids),
-        }
-        return text, meta
+            past_len = fused[0][0].shape[1]                  # = receiver length
+            cache = self._build_cache(fused)
+            prompt_ids = self.rtok(gen_prompt, return_tensors="pt",
+                                   add_special_tokens=False)["input_ids"].to(self.device)
+            gen_ids = self._greedy_from_cache(cache, past_len, prompt_ids, mnt, should_stop=should_stop)
+            text = self.rtok.decode(gen_ids, skip_special_tokens=True).strip()
+            meta = {
+                "gate": round(float(self.gate), 4), "aligned_layers": len(self.fuser.align),
+                "share_len": int(s_ids.shape[1]), "recv_len": int(r_ids.shape[1]),
+                "sharer_model": self.sharer_name, "receiver_model": self.receiver_name,
+                "new_tokens": len(gen_ids), "fuser": self.fuser_label,
+            }
+            return text, meta
+        finally:
+            if saved is not None:
+                with torch.no_grad():
+                    self.fuser.gate_logit.copy_(saved[0])
+                self.gate = saved[1]
 
     # -- receiver-alone generation (the gate-0 reference / no-fusion baseline) --
     def receiver_only(self, recv_text: str, gen_prompt: str, max_new_tokens: Optional[int] = None) -> str:
