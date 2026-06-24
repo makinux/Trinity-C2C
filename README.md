@@ -179,7 +179,8 @@ Everything below was actually run and verified on a local CPU machine (we avoid 
 
 ## License
 
-[Apache License 2.0](LICENSE) — Copyright 2026 NSS Co., Ltd.
+[Apache License 2.0](LICENSE) — Copyright 2026 © Northern system service Co.,Ltd. 
+
 See [NOTICE](NOTICE) for attribution, the unofficial-status statement, the source papers, and
 the handling of referenced models. Licenses for the models and datasets you use are governed
 separately by their respective providers.
