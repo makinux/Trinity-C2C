@@ -56,6 +56,45 @@ services:
       retries: 5
       start_period: 10s
 
+  # ----- gateway-c2c: gateway WITH the in-process C2C (KV-fusion) backend (no GPU) -----
+  #   Heavier image (Dockerfile.gateway.c2c = + torch + transformers, ~2GB). Runs REAL
+  #   heterogeneous Cache-to-Cache (SmolLM2-135M -> Qwen2.5-0.5B) in-process. One command:
+  #     docker compose --profile c2c up -d --build --wait gateway-c2c   # first run builds the image
+  #     # open http://localhost:8080/ , UNCHECK "Mock mode", CHECK "C2C (KV fusion)", set gate, Run
+  #     docker compose --profile c2c down                               # stop
+  #   The FIRST C2C request downloads the two small models into the hf-cache volume (a few minutes,
+  #   CPU). Subsequent runs reuse the cache. Bump models via SHARER_MODEL_ID / RECEIVER_MODEL_ID.
+  #   NOTE: name the service (as above) — it shares host port 8080 with the default `gateway`, so
+  #   run one OR the other. To run both, set GATEWAY_C2C_PORT to a free host port.
+  gateway-c2c:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway.c2c
+    image: trinity-c2c-gateway-c2c:latest
+    profiles: ["c2c"]
+    environment:
+      PYTHONUTF8: "1"
+      TRINITY_GATEWAY_HOST: "0.0.0.0"
+      TRINITY_GATEWAY_PORT: "8080"
+      TRINITY_GATEWAY_MOCK: "0"
+      TRINITY_C2C: "1"
+      TRINITY_C2C_GATE: ${TRINITY_C2C_GATE:-}                 # default = config.yml c2c.init_gate (0.05)
+      TRINITY_C2C_MAX_NEW_TOKENS: ${TRINITY_C2C_MAX_NEW_TOKENS:-256}
+      HF_HOME: /hf-cache
+      HF_TOKEN: ${HF_TOKEN:-}
+      SHARER_MODEL_ID: ${SHARER_MODEL_ID:-}                   # override the Thinker(sharer) model tag
+      RECEIVER_MODEL_ID: ${RECEIVER_MODEL_ID:-}               # override the Worker(receiver) model tag
+    ports:
+      - "${GATEWAY_C2C_PORT:-8080}:8080"                      # set GATEWAY_C2C_PORT to avoid the 8080 clash
+    volumes:
+      - hf-cache:/hf-cache                                    # persist downloaded models across runs
+    healthcheck:   # /healthz is cheap (no model load); the engine loads lazily on the first C2C run
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8080/healthz')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # ----- ollama: local OpenAI-compatible models (no GPU required; CPU works) -----
   #   Enable with the .env.ollama sample by naming the services (the `ollama` profile keeps them
   #   out of a bare `docker compose up`), e.g.:

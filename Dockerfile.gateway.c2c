@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# C2C-enabled gateway image: the lightweight API gateway PLUS torch + transformers, so the
+# in-process Cache-to-Cache (KV-fusion) backend can run heterogeneous C2C (SmolLM2-135M ->
+# Qwen2.5-0.5B) with NO GPU. Heavier (~2GB) than Dockerfile.gateway — used only by the `c2c`
+# compose profile. CPU-only torch. Corporate SSL inspection is passed via pip --trusted-host.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TRINITY_GATEWAY_HOST=0.0.0.0 \
+    TRINITY_GATEWAY_PORT=8080 \
+    TRINITY_GATEWAY_MOCK=0 \
+    TRINITY_C2C=1 \
+    HF_HOME=/hf-cache
+
+WORKDIR /app
+
+ARG TRUSTED="--trusted-host pypi.org --trusted-host files.pythonhosted.org"
+# CPU-only torch from the PyTorch index first, then the gateway + transformers stack from PyPI.
+RUN pip install $TRUSTED --trusted-host download.pytorch.org \
+        torch --index-url https://download.pytorch.org/whl/cpu
+COPY requirements-gateway-c2c.txt ./
+RUN pip install $TRUSTED -r requirements-gateway-c2c.txt
+
+COPY trinity/ ./trinity/
+COPY config.yml ./
+
+EXPOSE 8080
+# Defaults to the in-process C2C backend (TRINITY_C2C=1, MOCK=0). The first C2C request lazily
+# downloads the two small models into HF_HOME (mount a volume to persist them across runs).
+CMD ["python", "-m", "trinity.gateway"]

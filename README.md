@@ -70,7 +70,8 @@ See [docs/design.md](docs/design.md) for design details.
 ├── config.yml                 # role -> model and other settings (the main config file)
 ├── trinity/                   # Python package
 │   ├── config.py              # config.yml loader (built-in defaults, env overrides)
-│   ├── p0.py                  # orchestration (3 roles + loop control)
+│   ├── p0.py                  # orchestration (3 roles + loop control, text channel)
+│   ├── p1.py                  # C2C orchestration (Thinker->Worker via KV fusion; reuses p0 + events)
 │   ├── coordinator.py         # features (SLM hidden state) + linear head + learned coordinator
 │   ├── train.py               # coordinator training via sep-CMA-ES
 │   ├── eval.py                # execution scorer + policy comparison (bench)
@@ -83,6 +84,7 @@ See [docs/design.md](docs/design.md) for design details.
 │   ├── c2c_rope.py            # RoPE-aware alignment
 │   ├── c2c_fuser_hetero.py    # heterogeneous + RoPE + trainable fuser (integrated)
 │   ├── c2c_hetero_realrun.py  # on-device heterogeneous 2-model (SmolLM <-> Qwen)
+│   ├── c2c_edge.py            # reusable heterogeneous C2C edge + multi-token generation from fused KV
 │   ├── c2c_train_general.py   # data-scale / generalization training
 │   ├── events.py              # structured workflow-trace events (run() on_event hook)
 │   ├── mocks.py               # offline mock backend (run the gateway/UI without a GPU)
@@ -200,8 +202,38 @@ For **GPU vLLM** instead, start the `gpu` profile and run the gateway with `TRIN
 Per-role endpoint/model/key are overridable by env: `THINKER_URL` / `THINKER_MODEL_ID` /
 `THINKER_API_KEY` (and the `WORKER_`/`VERIFIER_` equivalents). Model-free check:
 `python -m trinity.gateway.selftest` (also wired into `scripts/selftest.sh`). Gateway env knobs:
-`TRINITY_GATEWAY_HOST` (default `127.0.0.1`), `TRINITY_GATEWAY_PORT` (default `8080`),
-`TRINITY_GATEWAY_MOCK` (`1` = offline mock).
+`TRINITY_GATEWAY_HOST` (default `127.0.0.1`), `TRINITY_GATEWAY_PORT` (default `8080`; the
+conventional `PORT` var wins if set), `TRINITY_GATEWAY_MOCK` (`1` = offline mock).
+
+### Try real C2C — heterogeneous KV fusion in-process (no GPU)
+
+The Ollama profile above runs the **text channel (P0)**: Ollama's OpenAI API only returns text, so
+no KV cache crosses between roles. To exercise the **actual Cache-to-Cache KV fusion** end-to-end —
+SmolLM2-135M (Thinker/Sharer) latently injected into Qwen2.5-0.5B (Worker/Receiver) — the models must
+run **in-process** (transformers). The `c2c` compose profile bundles a torch-enabled gateway image
+that does exactly this, on CPU:
+
+```bash
+docker compose --profile c2c up -d --build --wait gateway-c2c   # first run builds (~2GB) + pulls models
+# open http://localhost:8080/  → UNCHECK "Mock mode", CHECK "C2C (KV fusion)", set the gate, Run
+docker compose --profile c2c down                               # stop
+```
+
+The debug UI's Worker step now shows a **`⚡ C2C fusion`** row (gate, aligned layers, share→recv token
+lengths) — the heterogeneous KV edge, distinct from the text turns. Via the API, set
+`extra_body.trinity_c2c=true` (and optional `trinity_c2c_gate`); `trinity_trace=true` includes the
+`fusion` event.
+
+> **Honest scope:** this wires the C2C *plumbing* through the gateway. The fuser ships **untrained**, so
+> `gate=0` ≡ the Worker alone (safe; the plan rides the text channel) and **raising the gate degrades
+> quality** until the fuser is trained (see [results](#verified-results-honest)). It demonstrates the
+> mechanism live, not a quality gain.
+
+Local (no Docker): `pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt`,
+then `TRINITY_C2C=1 python -m trinity.gateway`. Verify the pieces directly:
+`python -m trinity.c2c_edge` (the fused-KV generation gate-0 invariant) and `python -m trinity.p1`
+(a full C2C run). C2C env knobs: `TRINITY_C2C` (`1` = default to the in-process fusion backend),
+`TRINITY_C2C_GATE` (0..1), `TRINITY_C2C_MAX_NEW_TOKENS`, `SHARER_MODEL_ID` / `RECEIVER_MODEL_ID`.
 
 ## Configuration (config.yml)
 
