@@ -27,8 +27,10 @@ services:
   # ----- gateway: OpenAI-compatible API + debug ChatUI on http://localhost:8080 -----
   #   Lightweight image (Dockerfile.gateway, no torch/transformers) — builds in seconds.
   #   Standalone by default: TRINITY_GATEWAY_MOCK=1 uses the offline mock backend (no GPU).
-  #     docker compose up -d gateway        # then open http://localhost:8080/
-  #   For real models, start the gpu profile and run with TRINITY_GATEWAY_MOCK=0.
+  #     docker compose up -d --build --wait gateway     # then open http://localhost:8080/
+  #   Real models via local Ollama (no GPU required):
+  #     docker compose --env-file .env.ollama up -d --build --wait gateway ollama ollama-pull
+  #   Real models via the gpu vLLM profile: set TRINITY_GATEWAY_MOCK=0 and start the gpu servers.
   gateway:
     build:
       context: .
@@ -42,6 +44,9 @@ services:
       THINKER_URL: ${THINKER_URL:-http://thinker:8000/v1}
       WORKER_URL: ${WORKER_URL:-http://worker:8000/v1}
       VERIFIER_URL: ${VERIFIER_URL:-http://verifier:8000/v1}
+      THINKER_MODEL_ID: ${THINKER_MODEL_ID:-}
+      WORKER_MODEL_ID: ${WORKER_MODEL_ID:-}
+      VERIFIER_MODEL_ID: ${VERIFIER_MODEL_ID:-}
     ports:
       - "8080:8080"
     healthcheck:
@@ -50,6 +55,48 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # ----- ollama: local OpenAI-compatible models (no GPU required; CPU works) -----
+  #   Enable with the .env.ollama sample by naming the services (the `ollama` profile keeps them
+  #   out of a bare `docker compose up`), e.g.:
+  #     cp .env.ollama.example .env.ollama
+  #     docker compose --env-file .env.ollama up -d --build --wait gateway ollama ollama-pull
+  #   The gateway (above) is pointed at this service via .env.ollama (THINKER_URL=...:11434/v1, MOCK=0).
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+    # Uncomment to also reach Ollama from the host (clashes with a host Ollama on 11434):
+    # ports: ["11434:11434"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    # Uncomment to give Ollama an NVIDIA GPU (otherwise it runs on CPU):
+    # deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  # One-shot: pulls the per-role model tags into the ollama volume, then exits.
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for m in "${THINKER_MODEL_ID:-qwen2.5:3b}" "${WORKER_MODEL_ID:-qwen2.5-coder:3b}" "${VERIFIER_MODEL_ID:-deepseek-r1:1.5b}"; do
+          echo "==> ollama pull $$m"; ollama pull "$$m";
+        done
+        echo "ollama-pull: done"
+    restart: "no"
 
   # ----- GPU: local LLM servers (OpenAI-compatible vLLM). Requires NVIDIA GPU + nvidia-container-toolkit -----
   # 1 service = 1 GPU reserved. If VRAM is short, adjust model / max-model-len / gpu-memory-utilization.
@@ -106,3 +153,4 @@ services:
 
 volumes:
   hf-cache:
+  ollama-data:

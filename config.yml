@@ -3,6 +3,7 @@
 #   The TRINITY_CONFIG env var can point to a different path. Defaults to ./config.yml.
 #   If the file or pyyaml is missing, the DEFAULTS in trinity_config.py are used.
 #   *_URL env vars (THINKER_URL/WORKER_URL/VERIFIER_URL) override base_url.
+#   <ROLE>_MODEL_ID env vars (THINKER_MODEL_ID/...) override model_id (e.g. to match an Ollama tag).
 #   Secrets are best passed via <ROLE>_API_KEY (e.g. WORKER_API_KEY) in the env (avoid plaintext YAML).
 # ============================================================
 

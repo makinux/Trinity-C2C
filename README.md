@@ -152,7 +152,7 @@ Both ways below default to the offline mock backend, so they work with no GPU/mo
 
 ```bash
 # Option A — Docker (lightweight image, no torch/transformers; builds in seconds):
-docker compose up -d --wait gateway                # then open http://localhost:8080/  (docker compose down to stop)
+docker compose up -d --build --wait gateway        # then open http://localhost:8080/  (docker compose down to stop)
 
 # Option B — local Python:
 pip install -r requirements.txt                    # adds fastapi + uvicorn
@@ -180,10 +180,28 @@ curl -s http://localhost:8080/v1/chat/completions \
 | `POST /debug/runs/stream` | live SSE trace consumed by the debug UI |
 | `GET /` | the debug ChatUI |
 
-For **real** models, start the role servers (e.g. the compose `gpu` profile) and run the
-gateway with `TRINITY_GATEWAY_MOCK=0`. Model-free check: `python -m trinity.gateway.selftest`
-(also wired into `scripts/selftest.sh`). Env knobs: `TRINITY_GATEWAY_HOST` (default
-`127.0.0.1`), `TRINITY_GATEWAY_PORT` (default `8080`), `TRINITY_GATEWAY_MOCK` (`1` = offline mock).
+### Try real models via local Ollama (no GPU required)
+
+The bundled `ollama` compose profile runs local OpenAI-compatible models and points all three
+roles at them — a one-command way to leave mock mode without a GPU:
+
+```bash
+cp .env.ollama.example .env.ollama
+docker compose --env-file .env.ollama up -d --build --wait gateway ollama ollama-pull   # first run builds + pulls (minutes)
+# open http://localhost:8080/  and UNCHECK "Mock mode (offline)", then Run
+docker compose down                                                                     # stop (down -v drops models)
+```
+
+`.env.ollama` sets `TRINITY_GATEWAY_MOCK=0`, points `*_URL` at `http://ollama:11434/v1`, and picks
+the per-role tags (`THINKER_MODEL_ID` / `WORKER_MODEL_ID` / `VERIFIER_MODEL_ID`, small CPU-friendly
+defaults). The `ollama-pull` service pulls exactly those tags into a persistent volume.
+
+For **GPU vLLM** instead, start the `gpu` profile and run the gateway with `TRINITY_GATEWAY_MOCK=0`.
+Per-role endpoint/model/key are overridable by env: `THINKER_URL` / `THINKER_MODEL_ID` /
+`THINKER_API_KEY` (and the `WORKER_`/`VERIFIER_` equivalents). Model-free check:
+`python -m trinity.gateway.selftest` (also wired into `scripts/selftest.sh`). Gateway env knobs:
+`TRINITY_GATEWAY_HOST` (default `127.0.0.1`), `TRINITY_GATEWAY_PORT` (default `8080`),
+`TRINITY_GATEWAY_MOCK` (`1` = offline mock).
 
 ## Configuration (config.yml)
 

@@ -16,12 +16,22 @@ Expected: `===== ALL SELFTESTS PASSED =====`
 A standalone OpenAI-compatible gateway + browser workflow debugger, built from
 `Dockerfile.gateway` (no torch/transformers — ~180 MB, builds in seconds):
 ```bash
-docker compose up -d gateway     # -> http://localhost:8080/  (offline mock backend by default)
-docker compose down              # stop
+docker compose up -d --build gateway   # -> http://localhost:8080/  (offline mock backend by default)
+docker compose down                    # stop
 ```
 - Open <http://localhost:8080/> for the debug UI; point any OpenAI client at `http://localhost:8080/v1`.
-- For real models, start the `gpu` profile and set `TRINITY_GATEWAY_MOCK=0` (the gateway reads
-  `THINKER_URL` / `WORKER_URL` / `VERIFIER_URL`, already wired in compose).
+- **Real models via local Ollama (no GPU):** the `ollama` profile runs OpenAI-compatible models and
+  the `ollama-pull` service fetches the per-role tags into a volume:
+  ```bash
+  cp .env.ollama.example .env.ollama
+  docker compose --env-file .env.ollama up -d --build --wait gateway ollama ollama-pull   # first run builds + pulls
+  # open http://localhost:8080/ and UNCHECK "Mock mode"
+  docker compose down                                                                     # down -v drops models
+  ```
+  `.env.ollama` sets `TRINITY_GATEWAY_MOCK=0`, the `*_URL` to `http://ollama:11434/v1`, and the
+  per-role `*_MODEL_ID` tags. Using `--env-file` keeps your default `.env` untouched.
+- **Real models via GPU vLLM:** start the `gpu` profile and set `TRINITY_GATEWAY_MOCK=0` (the gateway
+  reads `THINKER_URL`/`WORKER_URL`/`VERIFIER_URL`, already wired in compose).
 
 ## 2. On-device C2C transfer validation (small SLM; CPU is fine)
 ```bash

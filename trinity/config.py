@@ -69,6 +69,11 @@ def load_config(path: str | None = None) -> dict:
         key = os.getenv(f"{role.upper()}_API_KEY")
         if key:
             cfg["models"][role]["api_key"] = key
+    # Override model_id via <ROLE>_MODEL_ID env vars (e.g. to match an Ollama tag like qwen2.5-coder:3b)
+    for role in cfg.get("models", {}):
+        mid = os.getenv(f"{role.upper()}_MODEL_ID")
+        if mid:
+            cfg["models"][role]["model_id"] = mid
     return cfg
 
 
