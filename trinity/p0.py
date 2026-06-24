@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
 from trinity.config import CONFIG
+from trinity.events import (
+    DECISION, ERROR, FINAL, RUN_START, TURN_END, TURN_START, VERDICT,
+    EventCallback, EventEmitter,
+)
 
 
 # ============================================================
@@ -213,45 +218,94 @@ class Config:
 
 
 def run(query: str, coordinator: Coordinator, pool: dict[str, LocalModel],
-        cfg: Config = Config()) -> dict:
+        cfg: Config = Config(), *,
+        on_event: Optional[EventCallback] = None,
+        run_id: Optional[str] = None) -> dict:
+    """Run the orchestration loop.
+
+    ``on_event`` (optional) receives structured trace events (see ``trinity.events``) for
+    every Coordinator decision and role turn — this is what the gateway / debug UI consume.
+    It is purely observational: with ``on_event=None`` behavior is byte-for-byte unchanged.
+    ``pool`` only needs the ``ChatModel`` interface (``name`` + ``chat``); ``LocalModel`` and
+    ``trinity.mocks.MockModel`` both satisfy it.
+    """
+    em = EventEmitter(on_event, run_id)
     state = State(query=query)
     final: Optional[str] = None
     error: Optional[str] = None
 
-    for step in range(cfg.max_turns):
-        action = coordinator.decide(state)
-        if action is None:
-            break
+    em.emit(RUN_START, query=query, max_turns=cfg.max_turns, verbose=cfg.verbose)
 
-        model = pool[action.model_key]
-        user = build_user_prompt(action.role, state)
-        try:
-            out = model.chat(SYS[action.role], user)
-        except Exception as e:                       # a call failure aborts (P0 keeps it simple)
-            error = f"{model.name} call failed: {e}"
-            break
-        if not out:                                  # don't treat an empty response as an artifact
-            error = f"{model.name} returned empty output"
-            break
+    try:
+        for step in range(cfg.max_turns):
+            step_no = step + 1
+            action = coordinator.decide(state)
+            if action is None:
+                em.emit(DECISION, step=step_no, role=None, model_key=None, meta={},
+                        state_turns=len(state.turns), artifact_chars=len(state.artifact or ""),
+                        reason="coordinator_stop")
+                break
+            em.emit(DECISION, step=step_no, role=action.role.value, model_key=action.model_key,
+                    meta=action.meta, state_turns=len(state.turns),
+                    artifact_chars=len(state.artifact or ""), reason="action")
 
-        state.turns.append(Turn(action.role, model.name, out))
-        if cfg.verbose:
-            print(f"\n=== turn {step+1}: {action.role.value} ({model.name}) ===\n{out}")
+            model = pool[action.model_key]
+            user = build_user_prompt(action.role, state)
+            system = SYS[action.role]
+            em.emit(TURN_START, step=step_no, role=action.role.value, model_key=action.model_key,
+                    model_name=model.name, system=system, user=user)
 
-        if action.role == Role.WORKER:
-            state.artifact = out
-        if (action.role == Role.VERIFIER
-                and state.artifact                      # only when an artifact exists ...
-                and parse_verdict(out) == Verdict.ACCEPT):
-            final = state.artifact
-            break
+            t0 = time.perf_counter()
+            try:
+                out = model.chat(system, user)
+            except Exception as e:                   # a call failure aborts (P0 keeps it simple)
+                error = f"{model.name} call failed: {e}"
+                em.emit(ERROR, step=step_no, role=action.role.value, model_key=action.model_key,
+                        model_name=model.name, message=error)
+                break
+            duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+            if not out:                              # don't treat an empty response as an artifact
+                error = f"{model.name} returned empty output"
+                em.emit(ERROR, step=step_no, role=action.role.value, model_key=action.model_key,
+                        model_name=model.name, message=error)
+                break
 
-    return {
+            state.turns.append(Turn(action.role, model.name, out))
+            if action.role == Role.WORKER:
+                state.artifact = out
+            em.emit(TURN_END, step=step_no, role=action.role.value, model_key=action.model_key,
+                    model_name=model.name, output=out, output_chars=len(out),
+                    duration_ms=duration_ms, artifact_chars=len(state.artifact or ""),
+                    state_turns=len(state.turns))
+            if cfg.verbose:
+                print(f"\n=== turn {step_no}: {action.role.value} ({model.name}) ===\n{out}")
+
+            if action.role == Role.VERIFIER:
+                verdict = parse_verdict(out)
+                accepted = bool(state.artifact) and verdict == Verdict.ACCEPT
+                em.emit(VERDICT, step=step_no, verdict=verdict.value, accepted=accepted,
+                        artifact_chars=len(state.artifact or ""))
+                if accepted:
+                    final = state.artifact
+                    break
+    except Exception as e:
+        # Unexpected orchestration error (e.g. coordinator/prompt bug). Preserve the original
+        # propagation behavior, but always terminate the event stream with error + final first.
+        error = f"unexpected orchestration error: {e}"
+        em.emit(ERROR, step=None, role=None, model_key=None, model_name=None, message=error)
+        em.emit(FINAL, accepted=False, error=error, final=state.artifact,
+                final_chars=len(state.artifact or ""), turns=len(state.turns))
+        raise
+
+    result = {
         "final": final if final is not None else state.artifact,
         "accepted": final is not None,
         "error": error,
         "state": state,
     }
+    em.emit(FINAL, accepted=result["accepted"], error=error, final=result["final"],
+            final_chars=len(result["final"] or ""), turns=len(state.turns))
+    return result
 
 
 # ============================================================

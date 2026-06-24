@@ -12,6 +12,17 @@ docker compose run --rm app            # = sh selftest.sh (--selftest for every 
 ```
 Expected: `===== ALL SELFTESTS PASSED =====`
 
+## API gateway & debug UI (separate lightweight image)
+A standalone OpenAI-compatible gateway + browser workflow debugger, built from
+`Dockerfile.gateway` (no torch/transformers — ~180 MB, builds in seconds):
+```bash
+docker compose up -d gateway     # -> http://localhost:8080/  (offline mock backend by default)
+docker compose down              # stop
+```
+- Open <http://localhost:8080/> for the debug UI; point any OpenAI client at `http://localhost:8080/v1`.
+- For real models, start the `gpu` profile and set `TRINITY_GATEWAY_MOCK=0` (the gateway reads
+  `THINKER_URL` / `WORKER_URL` / `VERIFIER_URL`, already wired in compose).
+
 ## 2. On-device C2C transfer validation (small SLM; CPU is fine)
 ```bash
 docker compose run --rm app python trinity_c2c_realrun.py
@@ -45,5 +56,6 @@ docker compose --profile gpu down
 
 ## Files
 - `Dockerfile` / `requirements*.txt` / `selftest.sh` ... app image
-- `docker-compose.yml` / `.env.example` ... app + GPU vLLM servers
+- `Dockerfile.gateway` / `requirements-gateway.txt` ... lightweight API-gateway + debug-UI image
+- `docker-compose.yml` / `.env.example` ... app + gateway + GPU vLLM servers
 - `trinity_*.py` ... the implementation stack (7+1 files)

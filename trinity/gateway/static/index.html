@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trinity-C2C · Workflow Debugger</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">★</span>
+      <div>
+        <h1>Trinity-C2C Workflow Debugger</h1>
+        <p class="sub">Coordinator → Thinker → Worker → Verifier · live trace</p>
+      </div>
+    </div>
+    <div class="status">
+      <span id="health-dot" class="dot" title="gateway status"></span>
+      <span id="health-text">checking…</span>
+    </div>
+  </header>
+
+  <section class="controls">
+    <textarea id="query" rows="3" placeholder="Enter a task / query for the Trinity pipeline…">Write a Python function that merges two sorted lists. Also state its time complexity.</textarea>
+    <div class="controls-row">
+      <div class="opts">
+        <label class="switch"><input type="checkbox" id="mock" checked /> <span>Mock mode (offline)</span></label>
+        <label class="switch"><input type="checkbox" id="prompts" checked /> <span>Show prompts</span></label>
+        <label class="num">max_turns <input type="number" id="max-turns" min="1" max="20" value="5" /></label>
+        <label class="num">mock delay <input type="number" id="mock-delay" min="0" max="5" step="0.1" value="0.4" /> s</label>
+      </div>
+      <div class="actions">
+        <button id="run" class="btn primary">Run ▷</button>
+        <button id="stop" class="btn" disabled>Stop ◻</button>
+      </div>
+    </div>
+  </section>
+
+  <main>
+    <section class="pane timeline-pane">
+      <div class="pane-head">
+        <h2>Workflow timeline</h2>
+        <span id="run-meta" class="run-meta"></span>
+      </div>
+      <div id="timeline" class="timeline">
+        <div class="empty">Run a query to see the Coordinator route the Thinker / Worker / Verifier roles.</div>
+      </div>
+    </section>
+
+    <aside class="pane sidebar">
+      <div class="pane-head">
+        <h2>Final artifact</h2>
+        <span id="final-badge" class="badge"></span>
+      </div>
+      <div id="error-banner" class="error-banner hidden"></div>
+      <pre id="final" class="final-art">—</pre>
+
+      <details class="raw">
+        <summary>Raw events (<span id="raw-count">0</span>)</summary>
+        <pre id="raw-log" class="raw-log"></pre>
+      </details>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

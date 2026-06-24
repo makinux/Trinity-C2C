@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+# Lightweight image for the Trinity-C2C API gateway + debug UI.
+# The gateway talks to the role models over HTTP (OpenAI-compatible vLLM), so it needs NO
+# torch / transformers — only FastAPI + the openai client. Builds in seconds, stays small.
+# Corporate SSL inspection is passed via pip --trusted-host (override with --build-arg TRUSTED=...).
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TRINITY_GATEWAY_HOST=0.0.0.0 \
+    TRINITY_GATEWAY_PORT=8080 \
+    TRINITY_GATEWAY_MOCK=1
+
+WORKDIR /app
+
+ARG TRUSTED="--trusted-host pypi.org --trusted-host files.pythonhosted.org"
+COPY requirements-gateway.txt ./
+RUN pip install $TRUSTED -r requirements-gateway.txt
+
+COPY trinity/ ./trinity/
+COPY config.yml ./
+
+EXPOSE 8080
+# Standalone default = offline mock backend (no GPU). Set TRINITY_GATEWAY_MOCK=0 for real models.
+CMD ["python", "-m", "trinity.gateway"]

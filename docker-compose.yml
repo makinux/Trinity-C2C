@@ -24,6 +24,33 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface     # you may bind the host's ~/.cache/huggingface instead
 
+  # ----- gateway: OpenAI-compatible API + debug ChatUI on http://localhost:8080 -----
+  #   Lightweight image (Dockerfile.gateway, no torch/transformers) — builds in seconds.
+  #   Standalone by default: TRINITY_GATEWAY_MOCK=1 uses the offline mock backend (no GPU).
+  #     docker compose up -d gateway        # then open http://localhost:8080/
+  #   For real models, start the gpu profile and run with TRINITY_GATEWAY_MOCK=0.
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: trinity-c2c-gateway:latest
+    environment:
+      PYTHONUTF8: "1"
+      TRINITY_GATEWAY_HOST: "0.0.0.0"
+      TRINITY_GATEWAY_PORT: "8080"
+      TRINITY_GATEWAY_MOCK: ${TRINITY_GATEWAY_MOCK:-1}
+      THINKER_URL: ${THINKER_URL:-http://thinker:8000/v1}
+      WORKER_URL: ${WORKER_URL:-http://worker:8000/v1}
+      VERIFIER_URL: ${VERIFIER_URL:-http://verifier:8000/v1}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8080/healthz')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # ----- GPU: local LLM servers (OpenAI-compatible vLLM). Requires NVIDIA GPU + nvidia-container-toolkit -----
   # 1 service = 1 GPU reserved. If VRAM is short, adjust model / max-model-len / gpu-memory-utilization.
   thinker:

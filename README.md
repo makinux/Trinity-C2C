@@ -83,7 +83,10 @@ See [docs/design.md](docs/design.md) for design details.
 │   ├── c2c_rope.py            # RoPE-aware alignment
 │   ├── c2c_fuser_hetero.py    # heterogeneous + RoPE + trainable fuser (integrated)
 │   ├── c2c_hetero_realrun.py  # on-device heterogeneous 2-model (SmolLM <-> Qwen)
-│   └── c2c_train_general.py   # data-scale / generalization training
+│   ├── c2c_train_general.py   # data-scale / generalization training
+│   ├── events.py              # structured workflow-trace events (run() on_event hook)
+│   ├── mocks.py               # offline mock backend (run the gateway/UI without a GPU)
+│   └── gateway/               # OpenAI-compatible API + debug ChatUI (FastAPI + static)
 ├── scripts/selftest.sh        # all self-tests at once (no model needed)
 ├── docs/                      # design doc, paper summary, Docker notes
 ├── Dockerfile / docker-compose.yml
@@ -138,6 +141,49 @@ docker compose --profile gpu up -d --wait
 docker compose run --rm app python -m trinity.eval --trials 3
 ```
 See [docs/docker.md](docs/docker.md) for details.
+
+## API gateway & debug UI
+
+An OpenAI-compatible gateway fronts the whole pipeline as a single model (`trinity-p0`),
+together with a browser **workflow debugger** that traces every Coordinator decision and
+role turn (Thinker / Worker / Verifier) live.
+
+Both ways below default to the offline mock backend, so they work with no GPU/models.
+
+```bash
+# Option A — Docker (lightweight image, no torch/transformers; builds in seconds):
+docker compose up -d --wait gateway                # then open http://localhost:8080/  (docker compose down to stop)
+
+# Option B — local Python:
+pip install -r requirements.txt                    # adds fastapi + uvicorn
+TRINITY_GATEWAY_MOCK=1 python -m trinity.gateway   # -> http://127.0.0.1:8080
+```
+
+- **Debug UI** — open <http://localhost:8080/> in a browser **while the gateway is running**
+  (opening the raw `index.html` file won't reach the API). Enter a query, keep *Mock mode* on,
+  and watch the timeline stream `Coordinator → Thinker → Worker → Verifier (REVISE → ACCEPT)`,
+  each step showing the role output, the exact prompt it received, the verdict, and timing.
+- **OpenAI API** — point any OpenAI client at `http://localhost:8080/v1`:
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"trinity-p0",
+       "messages":[{"role":"user","content":"merge two sorted lists"}],
+       "extra_body":{"trinity_mock":true,"trinity_trace":true}}'
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/models` | lists the virtual model `trinity-p0` |
+| `POST /v1/chat/completions` | OpenAI-compatible (`stream:true` for SSE). Final artifact = assistant message; `extra_body.trinity_trace=true` adds the full workflow trace |
+| `POST /debug/runs/stream` | live SSE trace consumed by the debug UI |
+| `GET /` | the debug ChatUI |
+
+For **real** models, start the role servers (e.g. the compose `gpu` profile) and run the
+gateway with `TRINITY_GATEWAY_MOCK=0`. Model-free check: `python -m trinity.gateway.selftest`
+(also wired into `scripts/selftest.sh`). Env knobs: `TRINITY_GATEWAY_HOST` (default
+`127.0.0.1`), `TRINITY_GATEWAY_PORT` (default `8080`), `TRINITY_GATEWAY_MOCK` (`1` = offline mock).
 
 ## Configuration (config.yml)
 

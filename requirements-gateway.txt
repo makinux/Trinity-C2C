@@ -1,0 +1,7 @@
+# Minimal dependencies for the API gateway + debug UI (trinity.gateway).
+# The gateway reaches the role models over HTTP (OpenAI-compatible), so NO torch /
+# transformers are needed here — only the web framework and the openai client.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+openai>=1.0
+pyyaml>=6.0
