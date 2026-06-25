@@ -243,7 +243,8 @@ saves a checkpoint the gateway can load. Two objectives:
 
 ```bash
 # (a) distill — the gateway regime (recv==share): make a forced gate>0 track the receiver-alone
-#     output (gate>0 stops degrading). Trains Wk/Wv at a frozen gate; reports KL / greedy-match vs gate0.
+#     output. Default = on-policy/DAgger (re-roll the fused model's own trajectory -> fixes exposure
+#     bias); reports free-generation token-match vs gate0. (--no-on-policy = teacher-forced only.)
 python -m trinity.c2c_train --objective distill   --out checkpoints/distill.pt
 # (b) relational — country->capital with held-out: evidence the C2C mechanism GENERALIZES
 #     (reports learned vs gate0 vs shuffled logp on unseen countries).
@@ -257,16 +258,17 @@ A checkpoint stores the model ids / shapes / RoPE hashes / `state_dict`, and the
 load a mismatched one** (falling back to the safe untrained path). In the `c2c` Docker profile, mount
 `./checkpoints` and set `TRINITY_C2C_FUSER=/app/checkpoints/<name>.pt`.
 
-> **Scope (honest):** a fuser is task-specific. On CPU with these small models, `distill` trains the
-> fused (gate=0.3) KV to **reproduce the receiver's own gate=0 continuation**: teacher-forced
-> trajectory KL-vs-gate0 0.85→**0.11** and per-token match 65%→**97%** (it matches gate0's next-token
-> distribution very well, and avoids the worst failures — an untrained gate=0.3 flipped a prompt to
-> Chinese; the trained one stays on task). But **free generation still degenerates** after the first
-> few (correct) tokens — exposure bias the teacher-forced objective doesn't remove — so gate>0
-> degradation is **reduced, not eliminated**. `relational` only **uses the correct share content**
-> (learned `-8.32` > shuffled `-8.71`) but does **not** beat the no-injection baseline (learned <
-> gate0 `-6.07`). Neither makes gate>0 *improve* arbitrary code generation — that needs more
-> data/compute. Model-free loss checks: `python -m trinity.c2c_train --selftest`.
+> **Scope (honest):** a fuser is task-specific. `distill` (default = **on-policy / DAgger**: after a
+> teacher-forced warm-up, re-roll the *fused* model's own greedy trajectory and match gate0's
+> distribution at those visited states) drives **free-generation token-match vs gate0 from 18%→95%
+> and eliminates the repetition collapse** on its 16 training contexts — fixing the exposure bias the
+> earlier teacher-forced-only objective left (`--no-on-policy` hits teacher-forced match 97% but its
+> *free* generation still degenerates). **But it does not generalize**: on held-out contexts and the
+> gateway's gen_prompt regime, free generation still degrades — a data-scale frontier (16 contexts +
+> a linear fuser overfit). `relational` only **uses the correct share content** (learned `-8.32` >
+> shuffled `-8.71`) but does **not** beat the no-injection baseline (learned < gate0 `-6.07`).
+> Neither makes gate>0 *improve* arbitrary code generation; a lower gate injects less and degrades
+> less (gate→0 == receiver-alone). Model-free loss checks: `python -m trinity.c2c_train --selftest`.
 
 ## Configuration (config.yml)
 
@@ -299,13 +301,13 @@ Everything below was actually run and verified on a local CPU machine (we avoid 
 - **Trainable + loadable through the gateway (M2)**: the heterogeneous fuser trains, saves a
   checkpoint (model-ids / shapes / RoPE hashes validated), and the engine loads it (gate>0 then uses
   the trained weights; a mismatched checkpoint is refused -> safe untrained gate-0 fallback).
-- **`distill` reduces gate>0 degradation (M2)**: training the fuser to reproduce the receiver's own
-  gate=0 continuation (recv==share, frozen gate=0.3, teacher-forced trajectory KL) cut
-  `KL-vs-gate0` 0.85→**0.11** and raised per-token match 65%→**97%** — the fused KV matches gate0's
-  next-token distribution very well (and avoids the worst failures — an untrained gate=0.3 flipped a
-  prompt to Chinese; the trained one stays on task). But **free generation still degenerates** after
-  the first few correct tokens (exposure bias the teacher-forced objective doesn't remove), so
-  degradation is **reduced, not eliminated**.
+- **`distill` + on-policy refinement (M2/M3)**: teacher-forcing on the receiver's gate=0 trajectory
+  matches its next-token distribution (teacher-forced KL-vs-gate0 0.85→0.11, match 65→97%) but *free*
+  generation still degenerated — exposure bias. Adding **on-policy / DAgger** distillation (re-roll
+  the fused model's OWN greedy trajectory and match gate0's distribution at those visited states)
+  drives **free-generation token-match vs gate0 18%→95% and removes the repetition collapse** on the
+  16 training contexts. It does **not** generalize to held-out contexts or the gateway's gen_prompt
+  regime (a linear fuser + 16 contexts overfit) — a data-scale frontier, like `relational`.
 - **`relational` generalization (still WIP)**: heterogeneous country→capital with a held-out split —
   the trained fuser **uses the correct share content** (learned `-8.32` > shuffled `-8.71`) but does
   **not** beat the no-injection baseline (learned `-8.32` < gate0 `-6.07`). Consistent with prior

@@ -114,13 +114,14 @@ def _receiver_gate0_logits(ctx, recv_text):
         return ctx["rm"](input_ids=r_ids).logits[0, -1].float()
 
 
-def _gate0_trajectory(ctx, recv_layers, r_ids, n: int):
-    """Receiver-alone greedy continuation from the full ctx KV (the gate=0 generation the gateway
-    would produce). Returns (token_ids[n], per-step teacher logits [n, vocab]) — no grad."""
+def _greedy_rollout(ctx, layers, r_ids, n: int):
+    """Greedy free continuation from the full ctx KV `layers` (receiver-alone if recv_layers, or the
+    fused model if fused layers). Returns (token_ids[n], per-step logits [n, vocab]) — no grad.
+    This is the actual free-generation path (the model conditions on its OWN argmax outputs)."""
     from transformers import DynamicCache
     Lr = r_ids.shape[1]
     cache = DynamicCache()
-    for i, (K, V) in enumerate(recv_layers):
+    for i, (K, V) in enumerate(layers):
         cache.update(K[:, :Lr - 1, :].unsqueeze(0), V[:, :Lr - 1, :].unsqueeze(0), i)
     cur, nxt, toks, logits = Lr - 1, r_ids[:, -1:], [], []
     with torch.no_grad():
@@ -132,7 +133,16 @@ def _gate0_trajectory(ctx, recv_layers, r_ids, n: int):
             t = int(out.logits[0, -1].argmax())
             toks.append(t)
             nxt = torch.tensor([[t]])
-    return toks, torch.stack(logits)            # [n, vocab]
+    return toks, torch.stack(logits)
+
+
+def _max_repeat(toks: list[int]) -> int:
+    """Longest run of a single repeated token (a cheap degeneration indicator)."""
+    best = run = 1
+    for a, b in zip(toks, toks[1:]):
+        run = run + 1 if a == b else 1
+        best = max(best, run)
+    return best if toks else 0            # [n, vocab]
 
 
 def _continuation_logits(ctx, layers, r_ids, cont_ids: list[int]):
@@ -285,75 +295,97 @@ DISTILL_CONTEXTS = [
 ]
 
 
-def train_distill(ctx, *, steps=50, lr=0.05, gate=0.3, n_cont=8, seed=0) -> dict:
+def train_distill(ctx, *, steps=60, lr=0.05, gate=0.3, n_cont=8, on_policy=True, reroll=4,
+                  warmup=None, seed=0) -> dict:
+    """Distill the fused (frozen-gate) model to reproduce the receiver's own gate=0 generation.
+
+    Teacher-forcing on the gate0 trajectory matches the next-token distribution well but free
+    generation still degenerates (exposure bias: at inference the fused model conditions on its OWN
+    argmax tokens). ON-POLICY refinement (DAgger): after a teacher-forced warm-up, periodically
+    re-roll the FUSED model's own greedy trajectory and train it to match gate0's distribution at
+    *those* (visited) prefixes — plus a gate0 anchor for stability. Checkpoints are selected by the
+    honest FREE-generation metric (token-match vs gate0 + max-repeat), not teacher-forced KL.
+    """
     fuser = ctx["fuser"]
     torch.manual_seed(seed)
-    # Freeze the gate at the deployment value so the model can't trivially learn gate->0; train Wk/Wv.
-    with torch.no_grad():
+    with torch.no_grad():                                   # freeze the gate (no trivial gate->0 escape)
         fuser.gate_logit.fill_(float(np.log(gate / (1 - gate))))
     fuser.gate_logit.requires_grad_(False)
+    warmup = steps // 3 if warmup is None else warmup
 
-    # Per context: fuse inputs (recv==share) + the receiver's OWN gate0 continuation (the trajectory
-    # the gateway would generate). Matching it teacher-forced trains the fused KV to reproduce
-    # receiver-alone GENERATION, not just a single next-token (which collapses to a degenerate loop).
-    samples = []
+    samples = []                                            # recv==share; gate0 trajectory = warm-up teacher
     for text in DISTILL_CONTEXTS:
         fi = _fuse_inputs(ctx, text, text)
-        toks, t_logits = _gate0_trajectory(ctx, fi["recv_layers"], fi["r_ids"], n_cont)
-        samples.append({"fi": fi, "toks": toks, "t_probs": torch.softmax(t_logits, -1).detach()})
+        g0_toks, g0_logits = _greedy_rollout(ctx, fi["recv_layers"], fi["r_ids"], n_cont)
+        s = {"fi": fi, "g0_toks": g0_toks, "g0_probs": torch.softmax(g0_logits, -1).detach()}
+        s["op_toks"], s["op_probs"] = s["g0_toks"], s["g0_probs"]   # on-policy trajectory (refreshed)
+        samples.append(s)
 
-    def _student_logits(s):
-        fused = fuser.fuse(s["fi"]["recv_layers"], s["fi"]["sK"], s["fi"]["sV"],
-                           s["fi"]["sp"], s["fi"]["gidx"], s["fi"]["rp"])
-        return _continuation_logits(ctx, fused, s["fi"]["r_ids"], s["toks"])
+    def _fused_layers(s):
+        return fuser.fuse(s["fi"]["recv_layers"], s["fi"]["sK"], s["fi"]["sV"],
+                          s["fi"]["sp"], s["fi"]["gidx"], s["fi"]["rp"])
 
-    def _traj_loss(s):
-        sl = _student_logits(s)
-        return sum(distill_kl(sl[p], s["t_probs"][p]) for p in range(len(s["toks"]))) / len(s["toks"])
+    def _kl_on(s, toks, t_probs):                           # student fused, teacher-forced on `toks`
+        sl = _continuation_logits(ctx, _fused_layers(s), s["fi"]["r_ids"], toks)
+        return sum(distill_kl(sl[p], t_probs[p]) for p in range(len(toks))) / len(toks)
 
-    def eval_metrics():
+    def _refresh_on_policy(s):                              # roll the FUSED model's own trajectory
+        with torch.no_grad():
+            f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont)
+            t_logits = _continuation_logits(ctx, s["fi"]["recv_layers"], s["fi"]["r_ids"], f_toks)
+        s["op_toks"], s["op_probs"] = f_toks, torch.softmax(t_logits, -1).detach()
+
+    def free_gen_metrics():                                # the HONEST metric: free-roll fused vs gate0
         fuser.eval()
-        kls, matches = [], []
+        match, rep = [], []
         with torch.no_grad():
             for s in samples:
-                sl = _student_logits(s)
-                kls.append(float(sum(distill_kl(sl[p], s["t_probs"][p]) for p in range(len(s["toks"]))) / len(s["toks"])))
-                matches.append(float((sl.argmax(-1) == torch.tensor(s["toks"])).float().mean()))
-        return float(np.mean(kls)), float(np.mean(matches))
+                f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont)
+                match.append(float(np.mean([f == g for f, g in zip(f_toks, s["g0_toks"])])))
+                rep.append(_max_repeat(f_toks))
+        return float(np.mean(match)), float(np.mean(rep))
 
-    kl0, match0 = eval_metrics()
-    print(f"[distill] gate={gate} (frozen) | contexts={len(samples)} | n_cont={n_cont} | steps={steps}")
-    print(f"  baseline (untrained @ gate={gate}): mean_traj_KL(vs gate0)={kl0:.4f}  per-token match={match0:.0%}")
+    m0, r0 = free_gen_metrics()
+    g0_rep = float(np.mean([_max_repeat(s["g0_toks"]) for s in samples]))
+    print(f"[distill] gate={gate} (frozen) | contexts={len(samples)} | n_cont={n_cont} | steps={steps} "
+          f"| on_policy={on_policy} warmup={warmup} reroll={reroll}")
+    print(f"  baseline free-gen: token-match-vs-gate0={m0:.0%}  max-repeat={r0:.1f}  (gate0 itself={g0_rep:.1f})")
 
     opt = torch.optim.Adam([p for p in fuser.parameters() if p.requires_grad], lr=lr)
-    # Start best from the initial (frozen-gate) state so a checkpoint is always saved even if no
-    # step beats the baseline; training oscillates, so we keep the best-by-eval-KL state.
-    best = {"kl": kl0, "match": match0,
-            "state": {k: v.detach().clone() for k, v in fuser.state_dict().items()}}
+    best = {"match": m0, "rep": r0, "state": {k: v.detach().clone() for k, v in fuser.state_dict().items()}}
     for step in range(steps):
-        fuser.eval()        # gate is frozen -> use the deterministic gate (no Gumbel noise); Wk/Wv
-                            # still receive gradients (autograd is governed by requires_grad, not mode)
+        fuser.eval()                                        # frozen gate -> deterministic; Wk/Wv still train
+        on_pol = on_policy and step >= warmup
+        if on_pol and step % reroll == 0:
+            for s in samples:
+                _refresh_on_policy(s)
         opt.zero_grad()
-        loss = sum(_traj_loss(s) for s in samples) / len(samples)
+        loss = 0.0
+        for s in samples:
+            if on_pol:                                      # on-policy term + gate0 anchor (DAgger mix)
+                loss = loss + _kl_on(s, s["op_toks"], s["op_probs"]) + 0.5 * _kl_on(s, s["g0_toks"], s["g0_probs"])
+            else:
+                loss = loss + _kl_on(s, s["g0_toks"], s["g0_probs"])
+        loss = loss / len(samples)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in fuser.parameters() if p.requires_grad], 10.0)
         opt.step()
         if step % 4 == 0 or step == steps - 1:
-            kl, match = eval_metrics()
-            print(f"  step {step:2d} | train_KL {loss.item():.4f} | eval mean_traj_KL {kl:.4f} | per-token match {match:.0%}")
-            if kl < best["kl"]:
-                best = {"kl": kl, "match": match,
+            m, r = free_gen_metrics()
+            phase = "on-policy" if on_pol else "warmup"
+            print(f"  step {step:2d} ({phase}) | loss {loss.item():.4f} | free-gen match {m:.0%} max-repeat {r:.1f}")
+            if (m, -r) > (best["match"], -best["rep"]):     # select by free-gen match, tie-break on repetition
+                best = {"match": m, "rep": r,
                         "state": {k: v.detach().clone() for k, v in fuser.state_dict().items()}}
 
-    if best["state"] is not None:
-        fuser.load_state_dict(best["state"])               # restore the best-by-KL checkpoint
-    fuser.gate_logit.requires_grad_(True)                  # unfreeze for saving (state is what matters)
-    kl1, match1 = best["kl"], best["match"]
-    print("\n[distill verdict] (lower KL / higher match = gate>0 generation tracks gate=0 = non-degrading)")
-    print(f"  mean_traj_KL(vs gate0): {kl0:.4f} -> {kl1:.4f}   per-token match: {match0:.0%} -> {match1:.0%}  (best checkpoint)")
-    print(f"  {'OK: forced gate>0 now reproduces the receiver-alone continuation much more closely.' if kl1 < kl0 else 'NO improvement.'}")
-    return {"objective": "distill", "gate": gate, "steps": steps, "n_cont": n_cont,
-            "metrics": {"kl_before": kl0, "kl_after": kl1, "match_before": match0, "match_after": match1}}
+    fuser.load_state_dict(best["state"])                    # restore the best-by-free-gen checkpoint
+    fuser.gate_logit.requires_grad_(True)
+    m1, r1 = best["match"], best["rep"]
+    print("\n[distill verdict] (free-gen token-match vs gate0; higher match / lower repeat = less degeneration)")
+    print(f"  free-gen match: {m0:.0%} -> {m1:.0%}   max-repeat: {r0:.1f} -> {r1:.1f}  (best-by-free-gen checkpoint)")
+    print(f"  {'OK: fused free generation tracks the receiver-alone output more closely.' if m1 > m0 else 'NO improvement.'}")
+    return {"objective": "distill", "gate": gate, "steps": steps, "n_cont": n_cont, "on_policy": on_policy,
+            "metrics": {"match_before": m0, "match_after": m1, "rep_before": r0, "rep_after": r1}}
 
 
 # ============================================================
@@ -386,6 +418,10 @@ def selftest() -> None:
     assert losses[-1] < losses[0], f"contrastive_loss not decreasing: {losses[0]:.3f}->{losses[-1]:.3f}"
     assert float(correct.detach()) > float(max(wrongs_base)), "correct score did not rise above wrongs"
     print(f"[selftest] contrastive_loss raises correct above wrongs+margin: {losses[0]:.3f}->{losses[-1]:.3f} OK")
+
+    # _max_repeat: degeneration indicator (longest single-token run)
+    assert _max_repeat([1, 2, 3, 4]) == 1 and _max_repeat([5, 5, 5, 2, 9, 9]) == 3 and _max_repeat([]) == 0
+    print("[selftest] _max_repeat (degeneration metric) OK")
     print("[selftest] ALL PASSED")
 
 
@@ -400,6 +436,10 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=None, help="optimizer LR (defaults per objective)")
     ap.add_argument("--gate", type=float, default=0.3, help="distill: frozen gate; relational: init gate")
     ap.add_argument("--n-neg", type=int, default=3); ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--reroll", type=int, default=4, help="distill on-policy: re-roll fused trajectories every K steps")
+    ap.add_argument("--no-on-policy", action="store_false", dest="on_policy",
+                    help="distill: disable on-policy (DAgger) refinement, warm-up teacher-forcing only")
+    ap.set_defaults(on_policy=True)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -417,7 +457,8 @@ def main() -> None:
         meta = train_relational(ctx, steps=args.steps or 30, lr=args.lr or 0.08, margin=2.0,
                                 n_neg=args.n_neg, top_k=args.top_k, seed=args.seed)
     else:
-        meta = train_distill(ctx, steps=args.steps or 60, lr=args.lr or 0.05, gate=args.gate, seed=args.seed)
+        meta = train_distill(ctx, steps=args.steps or 60, lr=args.lr or 0.05, gate=args.gate,
+                             on_policy=args.on_policy, reroll=args.reroll, seed=args.seed)
 
     meta["sharer_model"] = sharer; meta["receiver_model"] = receiver
     path = save_fuser(ctx["fuser"], out, sharer_model=sharer, receiver_model=receiver,
