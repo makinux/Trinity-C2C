@@ -68,3 +68,5 @@ c2c:
   receiver_model: Qwen/Qwen2.5-0.5B-Instruct
   init_gate: 0.05
   tau: 1.0
+  fuser_path: null                 # path to a trained fuser checkpoint (trinity.c2c_train).
+                                   # null = untrained (gate-0 safe). Env TRINITY_C2C_FUSER overrides.

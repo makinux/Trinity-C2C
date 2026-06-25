@@ -235,6 +235,41 @@ then `TRINITY_C2C=1 python -m trinity.gateway`. Verify the pieces directly:
 (a full C2C run). C2C env knobs: `TRINITY_C2C` (`1` = default to the in-process fusion backend),
 `TRINITY_C2C_GATE` (0..1), `TRINITY_C2C_MAX_NEW_TOKENS`, `SHARER_MODEL_ID` / `RECEIVER_MODEL_ID`.
 
+### Training the fuser (so a checkpoint can be loaded)
+
+The bundled fuser is **untrained** (gate>0 degrades — see [scope](#try-real-c2c--heterogeneous-kv-fusion-in-process-no-gpu)).
+`trinity.c2c_train` trains the **engine-compatible** heterogeneous fuser (SmolLM→Qwen) on CPU and
+saves a checkpoint the gateway can load. Two objectives:
+
+```bash
+# (a) distill — the gateway regime (recv==share): make a forced gate>0 track the receiver-alone
+#     output. Default = on-policy/DAgger (re-roll the fused model's own trajectory -> fixes exposure
+#     bias); reports free-generation token-match vs gate0. (--no-on-policy = teacher-forced only.)
+python -m trinity.c2c_train --objective distill   --out checkpoints/distill.pt
+# (b) relational — country->capital with held-out: evidence the C2C mechanism GENERALIZES
+#     (reports learned vs gate0 vs shuffled logp on unseen countries).
+python -m trinity.c2c_train --objective relational --out checkpoints/relational.pt
+
+# load a checkpoint into the gateway/engine (validated against model ids + shapes + RoPE):
+TRINITY_C2C_FUSER=checkpoints/distill.pt python -m trinity.gateway     # or set c2c.fuser_path
+```
+
+A checkpoint stores the model ids / shapes / RoPE hashes / `state_dict`, and the engine **refuses to
+load a mismatched one** (falling back to the safe untrained path). In the `c2c` Docker profile, mount
+`./checkpoints` and set `TRINITY_C2C_FUSER=/app/checkpoints/<name>.pt`.
+
+> **Scope (honest):** a fuser is task-specific. `distill` (default = **on-policy / DAgger**: after a
+> teacher-forced warm-up, re-roll the *fused* model's own greedy trajectory and match gate0's
+> distribution at those visited states) drives **free-generation token-match vs gate0 from 18%→95%
+> and eliminates the repetition collapse** on its 16 training contexts — fixing the exposure bias the
+> earlier teacher-forced-only objective left (`--no-on-policy` hits teacher-forced match 97% but its
+> *free* generation still degenerates). **But it does not generalize**: on held-out contexts and the
+> gateway's gen_prompt regime, free generation still degrades — a data-scale frontier (16 contexts +
+> a linear fuser overfit). `relational` only **uses the correct share content** (learned `-8.32` >
+> shuffled `-8.71`) but does **not** beat the no-injection baseline (learned < gate0 `-6.07`).
+> Neither makes gate>0 *improve* arbitrary code generation; a lower gate injects less and degrades
+> less (gate→0 == receiver-alone). Model-free loss checks: `python -m trinity.c2c_train --selftest`.
+
 ## Configuration (config.yml)
 
 Manages per-role models and key settings in one place.
@@ -263,9 +298,21 @@ Everything below was actually run and verified on a local CPU machine (we avoid 
 - **On-device heterogeneous 2-model**: wired SmolLM2-135M (30 layers / 3 KV heads / rope 1e5)
   -> Qwen2.5-0.5B (24 / 2 / 1e6). Verified the machinery through tokenizer alignment, GQA, and
   **RoPE-aware** alignment (our own RoPE matches Qwen's rotary numerically).
-- **Generalization (WIP)**: with 24 countries + contrastive training, held-out `learned`
-  improves and uses the correct shared content (learned >> shuffled). However `learned < gate0`,
-  so **the threshold is barely missed** = scaling data/compute is the next step.
+- **Trainable + loadable through the gateway (M2)**: the heterogeneous fuser trains, saves a
+  checkpoint (model-ids / shapes / RoPE hashes validated), and the engine loads it (gate>0 then uses
+  the trained weights; a mismatched checkpoint is refused -> safe untrained gate-0 fallback).
+- **`distill` + on-policy refinement (M2/M3)**: teacher-forcing on the receiver's gate=0 trajectory
+  matches its next-token distribution (teacher-forced KL-vs-gate0 0.85→0.11, match 65→97%) but *free*
+  generation still degenerated — exposure bias. Adding **on-policy / DAgger** distillation (re-roll
+  the fused model's OWN greedy trajectory and match gate0's distribution at those visited states)
+  drives **free-generation token-match vs gate0 18%→95% and removes the repetition collapse** on the
+  16 training contexts. It does **not** generalize to held-out contexts or the gateway's gen_prompt
+  regime (a linear fuser + 16 contexts overfit) — a data-scale frontier, like `relational`.
+- **`relational` generalization (still WIP)**: heterogeneous country→capital with a held-out split —
+  the trained fuser **uses the correct share content** (learned `-8.32` > shuffled `-8.71`) but does
+  **not** beat the no-injection baseline (learned `-8.32` < gate0 `-6.07`). Consistent with prior
+  runs; scaling data/compute is the next step. Neither objective improves arbitrary code generation
+  (task-specific).
 
 ## Reference papers (sources of the ideas)
 

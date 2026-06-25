@@ -77,11 +77,11 @@ def run_c2c(query: str, engine, cfg: Config = Config(), *,
     final: Optional[str] = None
     error: Optional[str] = None
 
-    if gate is not None:
-        engine.set_gate(gate)
-
+    # A run-level gate is applied per Worker turn as a TEMPORARY override (c2c_edge save/restores it),
+    # so it never persists onto this shared engine; gate=None keeps the engine's gates (e.g. learned).
+    eff_gate = gate if gate is not None else engine.gate
     em.emit(RUN_START, query=query, max_turns=cfg.max_turns, verbose=cfg.verbose,
-            mode="c2c", gate=engine.gate,
+            mode="c2c", gate=eff_gate,
             sharer_model=engine.sharer_name, receiver_model=engine.receiver_name)
 
     try:
@@ -108,7 +108,7 @@ def run_c2c(query: str, engine, cfg: Config = Config(), *,
                 if role == Role.THINKER:
                     out, model_name = _run_thinker(engine, state, em, step_no)
                 elif role == Role.WORKER:
-                    out, model_name = _run_worker(engine, state, em, step_no, should_stop)
+                    out, model_name = _run_worker(engine, state, em, step_no, should_stop, gate)
                 elif role == Role.VERIFIER:
                     out, model_name = _run_verifier(verifier, engine, state, em, step_no)
                 else:
@@ -175,7 +175,7 @@ def _run_thinker(engine, state: State, em: EventEmitter, step_no: int) -> tuple[
 
 
 def _run_worker(engine, state: State, em: EventEmitter, step_no: int,
-                should_stop=None) -> tuple[str, str]:
+                should_stop=None, gate=None) -> tuple[str, str]:
     # Both models condition on the SAME Worker context; the Thinker's latent (KV) is what gets
     # injected. recv == share so char-span alignment over identical text is near-identity.
     worker_context = state.transcript()
@@ -187,7 +187,7 @@ def _run_worker(engine, state: State, em: EventEmitter, step_no: int,
     em.emit(TURN_START, step=step_no, role=Role.WORKER.value, model_key="worker",
             model_name=engine.receiver_name, system=system, user=worker_context + task)
     artifact, meta = engine.c2c_edge(share_text=worker_context, recv_text=worker_context,
-                                     gen_prompt=gen_prompt, should_stop=should_stop)
+                                     gen_prompt=gen_prompt, gate=gate, should_stop=should_stop)
     em.emit(FUSION, step=step_no, role=Role.WORKER.value, **meta)
     return artifact, engine.receiver_name
 
