@@ -39,7 +39,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from trinity.c2c import KVShape
 from trinity.c2c_rope import inv_freq_from_model
 from trinity.c2c_hetero import char_span_align
-from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser, load_fuser_into
+from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser, load_fuser_into, build_fuser_for_checkpoint
 from trinity.config import get
 from trinity.p0 import strip_think
 
@@ -114,18 +114,31 @@ class C2CEngine:
 
         self.sm, self.stok, s_inv, self.s_shape = _load(self.sharer_name, device, dtype)
         self.rm, self.rtok, r_inv, self.r_shape = _load(self.receiver_name, device, dtype)
-        # Construct with a clamped init_gate — the fuser ctor does math.log(g/(1-g)), which blows
-        # up at exactly 0 or 1 (a documented TRINITY_C2C_GATE=0 would crash) — then apply the
-        # requested gate through the saturating set_gate() below.
-        self.fuser = TorchHeteroRoPEFuser(self.s_shape, self.r_shape, s_inv, r_inv,
-                                          init_gate=min(max(gate, 1e-3), 1 - 1e-3), tau=tau).to(device)
+        # Optional trained fuser checkpoint. Resolution: arg > TRINITY_C2C_FUSER > config c2c.fuser_path.
+        self.fuser_path = fuser_path or os.getenv("TRINITY_C2C_FUSER") or get("c2c", "fuser_path", None) or None
+        # Construct with a clamped init_gate — the fuser ctor does math.log(g/(1-g)), which blows up at
+        # exactly 0 or 1 (a documented TRINITY_C2C_GATE=0 would crash) — then apply the requested gate
+        # through the saturating set_gate() below. When a checkpoint is set we build the CLASS/width it
+        # records (linear or MLP) so the strict load matches; reading it never loads weights or
+        # validates compatibility (load_fuser_into does that, with a safe fallback).
+        clamped = min(max(gate, 1e-3), 1 - 1e-3)
+        if self.fuser_path:
+            try:
+                self.fuser = build_fuser_for_checkpoint(self.fuser_path, self.s_shape, self.r_shape,
+                                                        s_inv, r_inv, init_gate=clamped, tau=tau).to(device)
+            except Exception as e:
+                print(f"[C2CEngine] WARNING: could not read fuser checkpoint {self.fuser_path!r}: {e}"
+                      f" -- using a default linear fuser.")
+                self.fuser = TorchHeteroRoPEFuser(self.s_shape, self.r_shape, s_inv, r_inv,
+                                                  init_gate=clamped, tau=tau).to(device)
+        else:
+            self.fuser = TorchHeteroRoPEFuser(self.s_shape, self.r_shape, s_inv, r_inv,
+                                              init_gate=clamped, tau=tau).to(device)
         self.fuser.eval()                 # eval => deterministic sigmoid gate (no Gumbel noise)
         self._recv_eos = {i for i in [self.rtok.eos_token_id] if i is not None}
         self.set_gate(gate)               # applies exact 0/1 via saturation; also sets self.gate
 
-        # Optional trained fuser checkpoint. Resolution: arg > TRINITY_C2C_FUSER > config c2c.fuser_path.
         # On any incompatibility we keep the fresh (untrained) fuser, which is gate-0 safe.
-        self.fuser_path = fuser_path or os.getenv("TRINITY_C2C_FUSER") or get("c2c", "fuser_path", None) or None
         self.fuser_loaded = False
         self.fuser_label = "untrained"
         if self.fuser_path:
@@ -135,7 +148,8 @@ class C2CEngine:
                                 expect_receiver_model=self.receiver_name)
                 self.fuser.eval()
                 self.fuser_loaded = True
-                self.fuser_label = f"trained:{os.path.basename(self.fuser_path)}"
+                arch = type(self.fuser).arch_name.replace("_rope_v1", "")
+                self.fuser_label = f"trained:{os.path.basename(self.fuser_path)} [{arch}]"
                 if gate_explicit:
                     self.set_gate(gate)   # an explicit gate overrides the checkpoint's learned gates
                 else:

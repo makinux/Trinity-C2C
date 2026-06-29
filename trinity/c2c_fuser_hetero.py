@@ -54,6 +54,8 @@ def t_unapply_rope(x, cos, sin):
 # Integrated module: heterogeneous + RoPE-aware + trainable
 # ============================================================
 class TorchHeteroRoPEFuser(nn.Module):
+    arch_name = "linear_rope_v1"
+
     def __init__(self, sharer: KVShape, receiver: KVShape, sharer_inv_freq, recv_inv_freq,
                  init_gate=0.05, tau=1.0):
         super().__init__()
@@ -81,6 +83,12 @@ class TorchHeteroRoPEFuser(nn.Module):
         L = X.shape[1]
         return (X.transpose(0, 1).reshape(L, -1) @ W).reshape(L, self.Hr, self.hdr).transpose(0, 1)
 
+    def _project(self, X, W, layer, which):                   # projection hook (subclasses add non-linearity)
+        """Map gathered sharer K/V at ``layer`` (``which`` in {"k","v"}) to receiver space. The base
+        class is purely linear (``X @ W``). For K this runs in the UN-ROTATED space; the caller
+        re-applies receiver RoPE afterwards (so a subclass's non-linearity stays before re-rotation)."""
+        return self._proj(X, W)
+
     def fuse(self, recv_layers, shareK_stored, shareV, sharer_positions, gather_idx, receiver_positions):
         """recv_layers: list[(K,V)] receiver (frozen). shareK_stored/shareV: list[K]/list[V] sharer (frozen, K is rotated).
         Return: list[(K,V)] fused (differentiable w.r.t. the fuser parameters)."""
@@ -94,14 +102,44 @@ class TorchHeteroRoPEFuser(nn.Module):
             if s is None or str(i) not in self.Wk:
                 out.append((Kr, Vr)); continue
             K_unrot = t_unapply_rope(shareK_stored[s], cs, ss)[:, idx, :]      # un-rotate -> gather to receiver positions
-            Kp = t_apply_rope(self._proj(K_unrot, self.Wk[str(i)]), cr, sr)    # project -> receiver RoPE
-            Vp = self._proj(shareV[s][:, idx, :], self.Wv[str(i)])             # V is not rotated
+            Kp = t_apply_rope(self._project(K_unrot, self.Wk[str(i)], i, "k"), cr, sr)   # project (maybe non-linear) -> receiver RoPE
+            Vp = self._project(shareV[s][:, idx, :], self.Wv[str(i)], i, "v")  # V is not rotated
             L = min(Kr.shape[1], Kp.shape[1])
             gi = g[i]
             Kf = torch.cat([(1 - gi) * Kr[:, :L] + gi * Kp[:, :L], Kr[:, L:]], dim=1)
             Vf = torch.cat([(1 - gi) * Vr[:, :L] + gi * Vp[:, :L], Vr[:, L:]], dim=1)
             out.append((Kf, Vf))
         return out
+
+
+class TorchHeteroRoPEMLPFuser(TorchHeteroRoPEFuser):
+    """Non-linear fuser: each per-layer K/V projection becomes ``X @ W_base + W2(GELU(X @ W1 + b1)) + b2``
+    (a residual MLP, hidden width ``hidden``). ``W2``/``b2`` initialize to ZERO, so the module starts
+    EXACTLY at the linear ``TorchHeteroRoPEFuser`` and only departs from it as the non-linear residual
+    is trained — preserving the untrained low-gate behavior the linear fuser already achieves. The
+    non-linearity acts in the projected, UN-ROTATED space (before receiver RoPE is re-applied to K; V
+    is never rotated), so the rotary structure the receiver expects is left intact."""
+    arch_name = "mlp_rope_v1"
+
+    def __init__(self, sharer: KVShape, receiver: KVShape, sharer_inv_freq, recv_inv_freq,
+                 init_gate=0.05, tau=1.0, hidden: int = 128):
+        super().__init__(sharer, receiver, sharer_inv_freq, recv_inv_freq, init_gate=init_gate, tau=tau)
+        self.hidden = hidden
+        din, dout = self.Hs * self.hds, self.Hr * self.hdr
+        self.mlp = nn.ParameterDict()
+        for i in self.align:
+            for which in ("k", "v"):
+                self.mlp[f"{which}1w_{i}"] = nn.Parameter(torch.randn(din, hidden) / din ** 0.5)
+                self.mlp[f"{which}1b_{i}"] = nn.Parameter(torch.zeros(hidden))
+                self.mlp[f"{which}2w_{i}"] = nn.Parameter(torch.zeros(hidden, dout))   # 0 -> residual starts at 0
+                self.mlp[f"{which}2b_{i}"] = nn.Parameter(torch.zeros(dout))
+
+    def _project(self, X, W, layer, which):
+        L = X.shape[1]
+        flat = X.transpose(0, 1).reshape(L, -1)                                 # [L, din]
+        h = torch.nn.functional.gelu(flat @ self.mlp[f"{which}1w_{layer}"] + self.mlp[f"{which}1b_{layer}"])
+        out = flat @ W + h @ self.mlp[f"{which}2w_{layer}"] + self.mlp[f"{which}2b_{layer}"]   # linear + residual
+        return out.reshape(L, self.Hr, self.hdr).transpose(0, 1)                # [Hr, L, hdr]
 
 
 # ============================================================
@@ -130,7 +168,8 @@ def save_fuser(fuser: "TorchHeteroRoPEFuser", path: str, *, sharer_model: str, r
     os.makedirs(parent, exist_ok=True)
     ckpt = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
-        "fuser_class": "TorchHeteroRoPEFuser",
+        "fuser_class": type(fuser).__name__,
+        "arch_name": getattr(fuser, "arch_name", "linear_rope_v1"),
         "sharer_model": sharer_model,
         "receiver_model": receiver_model,
         "sharer_shape": [sharer_shape.n_layers, sharer_shape.n_heads, sharer_shape.head_dim],
@@ -156,8 +195,9 @@ def load_fuser_into(fuser: "TorchHeteroRoPEFuser", path: str, *,
     if ckpt.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         raise CheckpointMismatch(
             f"format_version {ckpt.get('format_version')} != {CHECKPOINT_FORMAT_VERSION}")
-    if ckpt.get("fuser_class") != "TorchHeteroRoPEFuser":
-        raise CheckpointMismatch(f"fuser_class {ckpt.get('fuser_class')!r} unsupported")
+    if ckpt.get("fuser_class") != type(fuser).__name__:        # an MLP ckpt must load into an MLP fuser, etc.
+        raise CheckpointMismatch(
+            f"fuser_class {ckpt.get('fuser_class')!r} != target {type(fuser).__name__!r}")
     for label, got, exp in [("sharer_model", ckpt.get("sharer_model"), expect_sharer_model),
                             ("receiver_model", ckpt.get("receiver_model"), expect_receiver_model)]:
         if exp is not None and got != exp:
@@ -183,6 +223,32 @@ def load_fuser_into(fuser: "TorchHeteroRoPEFuser", path: str, *,
         fuser.load_state_dict(backup, strict=True)
         raise CheckpointMismatch(f"state_dict load failed (fuser restored): {e}") from e
     return ckpt
+
+
+# arch_name (stored in the checkpoint) -> fuser class. Legacy checkpoints have no arch_name -> linear.
+FUSER_ARCHS = {"linear_rope_v1": TorchHeteroRoPEFuser, "mlp_rope_v1": TorchHeteroRoPEMLPFuser}
+
+
+def build_fuser_for_checkpoint(path, sharer_shape: KVShape, receiver_shape: KVShape,
+                               sharer_inv_freq, recv_inv_freq, *, init_gate=0.05, tau=1.0,
+                               map_location="cpu") -> "TorchHeteroRoPEFuser":
+    """Read a checkpoint's arch tag and construct a matching (un-loaded) fuser of the right CLASS and
+    width, so a caller (e.g. the engine) can then ``load_fuser_into`` it. Legacy checkpoints with no
+    ``arch_name`` build the linear fuser. This reads the checkpoint into memory but does NOT load its
+    weights into a module or validate compatibility — ``load_fuser_into`` does that (strict)."""
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    arch = ckpt.get("arch_name") or "linear_rope_v1"
+    cls = FUSER_ARCHS.get(arch)
+    if cls is None:                                            # unknown arch -> safe: caller falls back to gate-0
+        raise CheckpointMismatch(f"unknown fuser arch_name {arch!r}")
+    kwargs = {"init_gate": init_gate, "tau": tau}
+    if cls is TorchHeteroRoPEMLPFuser:                         # infer hidden width from the saved residual weights
+        sd = ckpt.get("state_dict", {})
+        hid = next((v.shape[1] for k, v in sd.items() if k.startswith("mlp.") and "1w_" in k), None)
+        if hid is None:
+            raise CheckpointMismatch("mlp checkpoint missing mlp.*1w_* residual weights")
+        kwargs["hidden"] = int(hid)
+    return cls(sharer_shape, receiver_shape, sharer_inv_freq, recv_inv_freq, **kwargs)
 
 
 # ============================================================
@@ -242,6 +308,58 @@ def selftest():
             except CheckpointMismatch:
                 pass
         print("[selftest] checkpoint validation rejects model-id / shape mismatch OK")
+
+    # MLP fuser: starts EXACTLY at the linear fuser (zero residual), trains, round-trips, and an
+    # MLP checkpoint must NOT load into a linear fuser (and vice-versa).
+    lin = TorchHeteroRoPEFuser(sh, rh, sh_inv, rc_inv, init_gate=0.05)
+    mlp = TorchHeteroRoPEMLPFuser(sh, rh, sh_inv, rc_inv, init_gate=0.05, hidden=32)
+    with torch.no_grad():                                       # copy the shared linear weights so only the residual differs
+        for k in lin.Wk:
+            mlp.Wk[k].copy_(lin.Wk[k]); mlp.Wv[k].copy_(lin.Wv[k])
+        mlp.gate_logit.copy_(lin.gate_logit)
+    lin.eval(); mlp.eval()                                      # eval -> deterministic gate (no Gumbel noise) so the two are comparable
+    f_lin = lin.fuse(recv, shK, shV, sp, idx, rp)
+    f_mlp = mlp.fuse(recv, shK, shV, sp, idx, rp)
+    assert all(torch.allclose(a[0], b[0], atol=1e-5) and torch.allclose(a[1], b[1], atol=1e-5)
+               for a, b in zip(f_lin, f_mlp)), "MLP (zero residual) must start identical to the linear fuser"
+    print("[selftest] MLP fuser starts identical to linear (W2=0 residual) OK")
+
+    opt = torch.optim.Adam(mlp.parameters(), lr=0.05); mlp.train()
+    mlosses = []
+    for _ in range(200):
+        fused = mlp.fuse(recv, shK, shV, sp, idx, rp)
+        loss = sum(((Kf - Kt) ** 2).mean() + ((Vf - Vt) ** 2).mean()
+                   for (Kf, Vf), (Kt, Vt) in zip(fused, target))
+        opt.zero_grad(); loss.backward(); opt.step(); mlosses.append(loss.item())
+    assert mlosses[-1] < mlosses[0] * 0.6, f"MLP did not train: {mlosses[0]:.3f}->{mlosses[-1]:.3f}"
+    assert mlp.mlp["k2w_2"].grad is not None and torch.isfinite(mlp.mlp["k2w_2"].grad).all(), "MLP residual grad missing"
+    print(f"[selftest] MLP fuser trains (residual learns) {mlosses[0]:.3f}->{mlosses[-1]:.3f} OK")
+
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, "mlp.pt")
+        save_fuser(mlp, mp, sharer_model="s", receiver_model="r", sharer_shape=sh, receiver_shape=rh)
+        fresh_mlp = TorchHeteroRoPEMLPFuser(sh, rh, sh_inv, rc_inv, init_gate=0.05, hidden=32)
+        load_fuser_into(fresh_mlp, mp, expect_sharer_model="s", expect_receiver_model="r")
+        assert torch.allclose(fresh_mlp.mlp["v2w_1"], mlp.mlp["v2w_1"]), "MLP round-trip lost residual weights"
+        try:                                                    # MLP ckpt must reject a linear target
+            load_fuser_into(TorchHeteroRoPEFuser(sh, rh, sh_inv, rc_inv), mp); raise AssertionError("expected mismatch")
+        except CheckpointMismatch:
+            pass
+        print("[selftest] MLP checkpoint round-trips and rejects a linear target OK")
+
+        # build_fuser_for_checkpoint: reconstruct the right CLASS/width from the checkpoint tag, then load
+        lp = os.path.join(td, "lin.pt")
+        save_fuser(lin, lp, sharer_model="s", receiver_model="r", sharer_shape=sh, receiver_shape=rh)
+        built_lin = build_fuser_for_checkpoint(lp, sh, rh, sh_inv, rc_inv)
+        built_mlp = build_fuser_for_checkpoint(mp, sh, rh, sh_inv, rc_inv)
+        assert type(built_lin) is TorchHeteroRoPEFuser, "factory should rebuild a linear fuser for a linear ckpt"
+        assert type(built_mlp) is TorchHeteroRoPEMLPFuser and built_mlp.hidden == 32, "factory should rebuild MLP arch + width"
+        load_fuser_into(built_mlp, mp, expect_sharer_model="s", expect_receiver_model="r")    # and it strict-loads
+        try:                                                    # symmetry: a linear ckpt must reject an MLP target too
+            load_fuser_into(TorchHeteroRoPEMLPFuser(sh, rh, sh_inv, rc_inv, hidden=32), lp); raise AssertionError("expected mismatch")
+        except CheckpointMismatch:
+            pass
+        print("[selftest] build_fuser_for_checkpoint rebuilds arch/width and loads (+cross-arch reject) OK")
     print("[selftest] ALL PASSED")
 
 
