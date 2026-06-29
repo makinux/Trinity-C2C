@@ -14,8 +14,9 @@ Cache-to-Cache (KV-level latent communication). Runs entirely on local/open mode
   published papers. It is an unofficial implementation **unaffiliated** with the papers'
   authors or their institutions.
 - Each module's machinery is **verified by model-free self-tests** (`scripts/selftest.sh`).
-  That said, it does not ship a trained model that generalizes; **generalization is a
-  data-scale WIP** (see [results](#verified-results-honest)).
+  That said, it ships a fuser that **generalizes only in the non-degradation sense** (a trained
+  gate>0 tracks the receiver-alone output on held-out contexts) — not one that *improves* arbitrary
+  generation (see [results](#verified-results-honest)).
 - Models you use (Qwen/GLM/DeepSeek/SmolLM, etc.) are subject to **their own licenses**.
 
 ## Abstract
@@ -242,15 +243,19 @@ The bundled fuser is **untrained** (gate>0 degrades — see [scope](#try-real-c2
 saves a checkpoint the gateway can load. Two objectives:
 
 ```bash
-# (a) distill — the gateway regime (recv==share): make a forced gate>0 track the receiver-alone
-#     output. Default = on-policy/DAgger (re-roll the fused model's own trajectory -> fixes exposure
-#     bias); reports free-generation token-match vs gate0. (--no-on-policy = teacher-forced only.)
-python -m trinity.c2c_train --objective distill   --out checkpoints/distill.pt
+# (a) distill — the gateway regime (recv==share): train a forced gate>0 to track the receiver-alone
+#     (gate0) output. 64 diverse contexts + train/held-out split, the deployment gen_prompt regime, and
+#     KL over the WHOLE feed (gen_prompt-prefill + generation positions). Default = on-policy/DAgger
+#     (re-roll the fused model's own trajectory -> fixes exposure bias). Reports free-generation
+#     token-match vs gate0 on HELD-OUT (unseen) contexts. (--no-on-policy = teacher-forced only.)
+python -m trinity.c2c_train --objective distill --gate 0.1 --out checkpoints/distill.pt
+#     ...or a non-linear fuser (per-layer residual MLP) instead of the linear projection:
+python -m trinity.c2c_train --objective distill --gate 0.1 --fuser mlp --out checkpoints/distill_mlp.pt
 # (b) relational — country->capital with held-out: evidence the C2C mechanism GENERALIZES
 #     (reports learned vs gate0 vs shuffled logp on unseen countries).
 python -m trinity.c2c_train --objective relational --out checkpoints/relational.pt
 
-# load a checkpoint into the gateway/engine (validated against model ids + shapes + RoPE):
+# load a checkpoint into the gateway/engine (validated against model ids + shapes + RoPE; linear or MLP):
 TRINITY_C2C_FUSER=checkpoints/distill.pt python -m trinity.gateway     # or set c2c.fuser_path
 ```
 
@@ -258,17 +263,18 @@ A checkpoint stores the model ids / shapes / RoPE hashes / `state_dict`, and the
 load a mismatched one** (falling back to the safe untrained path). In the `c2c` Docker profile, mount
 `./checkpoints` and set `TRINITY_C2C_FUSER=/app/checkpoints/<name>.pt`.
 
-> **Scope (honest):** a fuser is task-specific. `distill` (default = **on-policy / DAgger**: after a
-> teacher-forced warm-up, re-roll the *fused* model's own greedy trajectory and match gate0's
-> distribution at those visited states) drives **free-generation token-match vs gate0 from 18%→95%
-> and eliminates the repetition collapse** on its 16 training contexts — fixing the exposure bias the
-> earlier teacher-forced-only objective left (`--no-on-policy` hits teacher-forced match 97% but its
-> *free* generation still degenerates). **But it does not generalize**: on held-out contexts and the
-> gateway's gen_prompt regime, free generation still degrades — a data-scale frontier (16 contexts +
-> a linear fuser overfit). `relational` only **uses the correct share content** (learned `-8.32` >
-> shuffled `-8.71`) but does **not** beat the no-injection baseline (learned < gate0 `-6.07`).
-> Neither makes gate>0 *improve* arbitrary code generation; a lower gate injects less and degrades
-> less (gate→0 == receiver-alone). Model-free loss checks: `python -m trinity.c2c_train --selftest`.
+> **Scope (honest):** a fuser is task-specific. With **64 diverse contexts + the deployment gen_prompt
+> regime + KL over the whole feed (gen_prompt-prefill positions included) at gate 0.1**, `distill`
+> (on-policy / DAgger) makes the forced gate>0 free generation **track the receiver-alone (gate0) output
+> on HELD-OUT (unseen) contexts: token-match-vs-gate0 38%→59%**, and on-policy training keeps *improving*
+> held-out — it **generalizes** rather than memorizes. The lever was **data scale + gen_prompt-position
+> supervision**: the earlier 16-context / generation-only-KL setup overfit (held-out peaked at step 0
+> then degraded). A **non-linear MLP fuser** (`--fuser mlp`, per-layer residual MLP) does **not** beat
+> the linear one (~50% ≤ 59%) — at gate 0.1 the fused KV is a small correction the linear projection
+> already captures, so capacity is not the bottleneck. This is **non-degradation** (gate>0 stops
+> drifting from gate0), NOT a quality gain — neither objective makes gate>0 *improve* arbitrary code
+> generation. `relational` only **uses the correct share content** (learned `-8.32` > shuffled `-8.71`)
+> but does not beat the no-injection baseline. Model-free checks: `python -m trinity.c2c_train --selftest`.
 
 ## Configuration (config.yml)
 
@@ -299,15 +305,21 @@ Everything below was actually run and verified on a local CPU machine (we avoid 
   -> Qwen2.5-0.5B (24 / 2 / 1e6). Verified the machinery through tokenizer alignment, GQA, and
   **RoPE-aware** alignment (our own RoPE matches Qwen's rotary numerically).
 - **Trainable + loadable through the gateway (M2)**: the heterogeneous fuser trains, saves a
-  checkpoint (model-ids / shapes / RoPE hashes validated), and the engine loads it (gate>0 then uses
-  the trained weights; a mismatched checkpoint is refused -> safe untrained gate-0 fallback).
-- **`distill` + on-policy refinement (M2/M3)**: teacher-forcing on the receiver's gate=0 trajectory
-  matches its next-token distribution (teacher-forced KL-vs-gate0 0.85→0.11, match 65→97%) but *free*
-  generation still degenerated — exposure bias. Adding **on-policy / DAgger** distillation (re-roll
-  the fused model's OWN greedy trajectory and match gate0's distribution at those visited states)
-  drives **free-generation token-match vs gate0 18%→95% and removes the repetition collapse** on the
-  16 training contexts. It does **not** generalize to held-out contexts or the gateway's gen_prompt
-  regime (a linear fuser + 16 contexts overfit) — a data-scale frontier, like `relational`.
+  checkpoint (model-ids / shapes / RoPE hashes / **arch tag** validated), and the engine loads it —
+  linear **or** the non-linear MLP fuser (the engine reads the checkpoint's `arch_name` and builds the
+  matching class); a mismatched checkpoint is refused -> safe untrained gate-0 fallback.
+- **`distill` exposure-bias fix, then held-out generalization (M2/M3/M4)**: teacher-forcing on the
+  receiver's gate0 trajectory matched its next-token distribution but *free* generation degenerated
+  (exposure bias); **on-policy / DAgger** (re-roll the fused model's OWN trajectory, match gate0 at the
+  visited states) fixed that on the training contexts (18%→95%). Generalizing to **held-out** then took
+  two more levers: (1) **match the deployment gen_prompt regime and take KL over the whole feed**
+  (gen_prompt-prefill positions too — at gate>0 the prompt is computed over the perturbed fused KV, so
+  those positions must be supervised); (2) **scale to 64 diverse contexts** (16 overfit: held-out
+  peaked at step 0 then degraded). Together, at gate 0.1, free-generation token-match-vs-gate0 on
+  **HELD-OUT contexts reaches 38%→59%** and on-policy training keeps improving it (genuine
+  generalization). A **non-linear MLP fuser** (`--fuser mlp`) does **not** beat the linear one
+  (~50% ≤ 59%): at low gate the linear projection already captures the small correction, so capacity is
+  not the bottleneck. Still **non-degradation** (gate>0 tracking gate0), not arbitrary-code-gen quality.
 - **`relational` generalization (still WIP)**: heterogeneous country→capital with a held-out split —
   the trained fuser **uses the correct share content** (learned `-8.32` > shuffled `-8.71`) but does
   **not** beat the no-injection baseline (learned `-8.32` < gate0 `-6.07`). Consistent with prior

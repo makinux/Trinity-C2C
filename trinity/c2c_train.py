@@ -41,7 +41,7 @@ except Exception:
     pass
 
 from trinity.c2c import KVShape
-from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser, save_fuser
+from trinity.c2c_fuser_hetero import TorchHeteroRoPEFuser, TorchHeteroRoPEMLPFuser, save_fuser
 from trinity.config import get
 
 
@@ -70,11 +70,12 @@ def distill_kl(student_logits: torch.Tensor, teacher_probs: torch.Tensor) -> tor
 # ============================================================
 # On-device helpers (reuse the engine's exact load/encode so checkpoints are engine-compatible)
 # ============================================================
-def _setup(sharer: str, receiver: str, *, device="cpu", init_gate=0.1, tau=1.0):
+def _setup(sharer: str, receiver: str, *, device="cpu", init_gate=0.1, tau=1.0, fuser_arch="linear"):
     from trinity.c2c_edge import _load, _encode          # lazy (torch); identical to the engine
     sm, stok, s_inv, s_shape = _load(sharer, device, torch.float32)
     rm, rtok, r_inv, r_shape = _load(receiver, device, torch.float32)
-    fuser = TorchHeteroRoPEFuser(s_shape, r_shape, s_inv, r_inv, init_gate=init_gate, tau=tau).to(device)
+    Fuser = TorchHeteroRoPEMLPFuser if fuser_arch == "mlp" else TorchHeteroRoPEFuser
+    fuser = Fuser(s_shape, r_shape, s_inv, r_inv, init_gate=init_gate, tau=tau).to(device)
     return {"sm": sm, "stok": stok, "rm": rm, "rtok": rtok, "s_inv": s_inv, "r_inv": r_inv,
             "s_shape": s_shape, "r_shape": r_shape, "fuser": fuser, "sharer": sharer,
             "receiver": receiver, "device": device, "_encode": _encode}
@@ -114,25 +115,35 @@ def _receiver_gate0_logits(ctx, recv_text):
         return ctx["rm"](input_ids=r_ids).logits[0, -1].float()
 
 
-def _greedy_rollout(ctx, layers, r_ids, n: int):
+def _greedy_rollout(ctx, layers, r_ids, n: int, prompt_ids=None):
     """Greedy free continuation from the full ctx KV `layers` (receiver-alone if recv_layers, or the
     fused model if fused layers). Returns (token_ids[n], per-step logits [n, vocab]) — no grad.
-    This is the actual free-generation path (the model conditions on its OWN argmax outputs)."""
+
+    ``prompt_ids`` matches the deployment regime (``c2c_edge._greedy_from_cache``): the FULL ctx KV
+    is the past, the gen_prompt is prefilled live, then generation continues. With no prompt it falls
+    back to immediate continuation (last ctx token live, rest as past)."""
     from transformers import DynamicCache
     Lr = r_ids.shape[1]
+    has_prompt = prompt_ids is not None and prompt_ids.shape[1] > 0
+    past = Lr if has_prompt else Lr - 1                       # full ctx as past when a prompt follows
     cache = DynamicCache()
     for i, (K, V) in enumerate(layers):
-        cache.update(K[:, :Lr - 1, :].unsqueeze(0), V[:, :Lr - 1, :].unsqueeze(0), i)
-    cur, nxt, toks, logits = Lr - 1, r_ids[:, -1:], [], []
+        cache.update(K[:, :past, :].unsqueeze(0), V[:, :past, :].unsqueeze(0), i)
+    prefill = prompt_ids if has_prompt else r_ids[:, -1:]
+    m = prefill.shape[1]
+    toks, logits = [], []
     with torch.no_grad():
+        out = ctx["rm"](input_ids=prefill, attention_mask=torch.ones((1, past + m), dtype=torch.long),
+                        position_ids=torch.arange(past, past + m).unsqueeze(0),
+                        past_key_values=cache, use_cache=True)
+        cur = past + m
         for _ in range(n):
-            out = ctx["rm"](input_ids=nxt, attention_mask=torch.ones((1, cur + 1), dtype=torch.long),
-                            position_ids=torch.tensor([[cur]]), past_key_values=cache, use_cache=True)
-            cur += 1
             logits.append(out.logits[0, -1].float())
             t = int(out.logits[0, -1].argmax())
             toks.append(t)
-            nxt = torch.tensor([[t]])
+            out = ctx["rm"](input_ids=torch.tensor([[t]]), attention_mask=torch.ones((1, cur + 1), dtype=torch.long),
+                            position_ids=torch.tensor([[cur]]), past_key_values=cache, use_cache=True)
+            cur += 1
     return toks, torch.stack(logits)
 
 
@@ -145,33 +156,52 @@ def _max_repeat(toks: list[int]) -> int:
     return best if toks else 0            # [n, vocab]
 
 
-def _continuation_logits(ctx, layers, r_ids, cont_ids: list[int]):
-    """Teacher-forced: with `layers` (full ctx KV) as past, feed [last_ctx_token, *cont_ids[:-1]] and
-    return logits [n, vocab] predicting cont_ids[0..n-1] (differentiable through `layers`)."""
+def _feed(pid, toks: list[int]):
+    """The live tokens fed after the full ctx KV (positions Lr..): ``[gen_prompt, toks[:-1]]``. Each
+    feed position predicts the next token, so supervising the WHOLE feed gives one target per
+    gen_prompt-prefill position AND per generation position."""
+    if len(toks) > 1:
+        return torch.cat([pid, torch.tensor([toks[:-1]], dtype=torch.long)], dim=1)
+    return pid
+
+
+def _feed_logits(ctx, layers, r_ids, feed_ids):
+    """Logits at EVERY position of ``feed_ids``, placed live after the full ctx KV ``layers`` (past=Lr,
+    positions Lr.. ; feed position j predicts feed_ids[j+1]). Differentiable through ``layers``.
+
+    Matching fused vs gate0 over the WHOLE feed supervises the gen_prompt-prefill positions too (not
+    only generation): in the deployment regime the receiver computes the gen_prompt by attending to the
+    (gate>0 perturbed) fused ctx KV, so that perturbation is baked into the prompt hidden states BEFORE
+    the first generation token — output-KL at generation positions alone cannot correct it."""
     from transformers import DynamicCache
     Lr = r_ids.shape[1]
     cache = DynamicCache()
     for i, (K, V) in enumerate(layers):
-        cache.update(K[:, :Lr - 1, :].unsqueeze(0), V[:, :Lr - 1, :].unsqueeze(0), i)
-    prev = torch.tensor([cont_ids[:-1]], dtype=torch.long) if len(cont_ids) > 1 else torch.empty((1, 0), dtype=torch.long)
-    feed = torch.cat([r_ids[:, -1:], prev], dim=1)            # [1, n]
-    n = feed.shape[1]
-    out = ctx["rm"](input_ids=feed, attention_mask=torch.ones((1, Lr - 1 + n), dtype=torch.long),
-                    position_ids=torch.arange(Lr - 1, Lr - 1 + n).unsqueeze(0),
+        cache.update(K[:, :Lr, :].unsqueeze(0), V[:, :Lr, :].unsqueeze(0), i)
+    Fn = feed_ids.shape[1]
+    out = ctx["rm"](input_ids=feed_ids, attention_mask=torch.ones((1, Lr + Fn), dtype=torch.long),
+                    position_ids=torch.arange(Lr, Lr + Fn).unsqueeze(0),
                     past_key_values=cache, use_cache=False)
-    return out.logits[0].float()                 # [n, vocab]
+    return out.logits[0].float()                              # [Fn, vocab]
 
 
 def _freeze_below_top_k(fuser: TorchHeteroRoPEFuser, k: int | None) -> None:
-    """Train only the top-k terminal receiver layers' Wk/Wv (reduce capacity / CPU cost)."""
+    """Train only the top-k terminal receiver layers' Wk/Wv (and any MLP residual) — reduce capacity /
+    CPU cost. Freezes the matching ``mlp.*_<i>`` params too so an MLP fuser actually respects --top-k."""
     if not k:
         return
     layers = sorted(int(i) for i in fuser.Wk.keys())
     keep = set(layers[-k:])
+    mlp = getattr(fuser, "mlp", None)
     for i in layers:
         if i not in keep:
             fuser.Wk[str(i)].requires_grad_(False)
             fuser.Wv[str(i)].requires_grad_(False)
+            if mlp is not None:
+                for part in (f"k1w_{i}", f"k1b_{i}", f"k2w_{i}", f"k2b_{i}",
+                             f"v1w_{i}", f"v1b_{i}", f"v2w_{i}", f"v2b_{i}"):
+                    if part in mlp:
+                        mlp[part].requires_grad_(False)
 
 
 # ============================================================
@@ -276,23 +306,123 @@ def train_relational(ctx, *, steps=30, lr=0.08, margin=2.0, n_neg=3, lam_reg=1e-
 # Self-distillation (distill objective) — gateway regime: recv == share, fixed gate
 # ============================================================
 DISTILL_CONTEXTS = [
+    # --- Python ---
     "def merge(a, b):\n    out = []\n    i = j = 0\n    while i < len(a) and j < len(b):",
-    "The quick brown fox jumps over the lazy dog and then",
     "import os\nimport sys\n\ndef main():\n    path = sys.argv[1]\n    with open(path) as f:",
-    "In this paper we propose a method that combines",
     "To compute the factorial of n recursively we",
     "class Stack:\n    def __init__(self):\n        self.items = []\n    def push(self, x):",
-    "The capital of France is Paris and the capital of Japan is",
     "for i in range(10):\n    if i % 2 == 0:\n        print(",
     "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:",
-    "Once upon a time in a small village there lived a",
-    "SELECT name, COUNT(*) FROM users GROUP BY name HAVING",
-    "The derivative of x squared with respect to x is",
     "try:\n    result = compute(x)\nexcept ValueError as e:\n    ",
-    "Machine learning models are trained by minimizing a",
     "# Returns the nth Fibonacci number\ndef fib(n):\n    if n < 2:",
+    "with open('out.txt', 'w') as f:\n    for line in lines:\n        f.write(",
+    "def count_words(text):\n    counts = {}\n    for word in text.split():",
+    "import numpy as np\narr = np.zeros((3, 3))\nfor i in range(3):",
+    "@dataclass\nclass Point:\n    x: float\n    y: float\n    def dist(self):",
+    # --- other languages ---
+    "function debounce(fn, delay) {\n  let timer;\n  return function(...args) {",
+    "const sum = arr.reduce((acc, x) =>",
+    "export async function fetchUser(id) {\n  const res = await fetch(",
+    "document.querySelectorAll('.item').forEach(el =>",
+    "#include <stdio.h>\nint main() {\n    int sum = 0;\n    for (int i = 0;",
+    "public class Main {\n    public static void main(String[] args) {\n        System.out.",
+    "func quicksort(arr []int) []int {\n    if len(arr) <= 1 {",
+    "fn factorial(n: u64) -> u64 {\n    if n == 0 {",
+    "SELECT name, COUNT(*) FROM users GROUP BY name HAVING",
+    "UPDATE accounts SET balance = balance - 100 WHERE",
+    "SELECT u.name, o.total FROM users u JOIN orders o ON",
+    "#!/bin/bash\nfor file in *.txt; do\n    echo",
+    "grep -rn 'TODO' . | awk -F:",
+    ".container {\n  display: flex;\n  justify-content:",
+    # --- math ---
+    "The derivative of x squared with respect to x is",
+    "The integral of cos(x) with respect to x is",
+    "Solving the quadratic equation ax^2 + bx + c = 0 gives x =",
+    "The sum of the first n natural numbers equals",
+    "A prime number is a natural number greater than 1 that",
+    "The probability of rolling a six on a fair die is",
+    "By the Pythagorean theorem, the hypotenuse equals",
+    # --- science ---
+    "Machine learning models are trained by minimizing a",
+    "Water is composed of two hydrogen atoms and one",
+    "The mitochondria is often called the powerhouse of the",
+    "Newton's second law states that force equals mass times",
+    "The speed of light in a vacuum is approximately",
+    "DNA is structured as a double helix consisting of",
+    "The Earth orbits the Sun once every",
+    # --- narrative / prose ---
+    "The quick brown fox jumps over the lazy dog and then",
+    "Once upon a time in a small village there lived a",
+    "In this paper we propose a method that combines",
+    "She opened the old wooden door and found",
+    "The detective examined the room carefully, noting that",
+    "After years of travel, he finally returned to",
+    "The storm grew stronger as the ship sailed into",
+    "Dear Sir or Madam,\n\nI am writing to apply for",
+    # --- factual / QA ---
+    "The capital of France is Paris and the capital of Japan is",
     "The three primary colors are red, green, and",
+    "The largest ocean on Earth is the",
+    "The author of Romeo and Juliet is",
+    "The chemical symbol for gold is",
+    "The first president of the United States was",
+    "Mount Everest is the tallest mountain in the",
+    "The currency used in Japan is the",
+    # --- procedural / lists ---
+    "To make a cup of tea, first you boil",
+    "Step 1: Preheat the oven to 350 degrees. Step 2:",
+    "The main causes of climate change include",
+    "A balanced diet should include proteins, carbohydrates, and",
+    "The seven continents of the world are",
+    "The four seasons of the year are spring, summer,",
+    "A traffic light shows three colors: red, yellow, and",
+    "The planets in order from the Sun are Mercury, Venus,",
 ]
+
+# Held-out contexts (NOT in DISTILL_CONTEXTS) — selection + the reported metric use these, so we
+# measure GENERALIZATION (reproduce gate0 on unseen contexts) rather than memorization.
+HELDOUT_CONTEXTS = [
+    "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[0]\n    rest =",
+    "while True:\n    cmd = input()\n    if cmd == 'quit':\n        break\n    else:",
+    "The largest planet in the solar system is Jupiter, and the second largest is",
+    "import json\nwith open('data.json') as f:\n    data = json.load(f)\nfor item in",
+    "Photosynthesis is the process by which plants convert sunlight into",
+    "CREATE TABLE users (\n    id INTEGER PRIMARY KEY,\n    name TEXT NOT NULL,\n    email",
+    "def is_prime(n):\n    if n < 2:\n        return False\n    for i in range(2,",
+    "The result of 7 multiplied by 8 is 56, and 9 multiplied by 6 is",
+    "const numbers = [5, 3, 8, 1];\nnumbers.sort((a, b) =>",
+    "The boiling point of water at sea level is",
+    "The formula for the area of a circle is",
+    "He picked up the phone and heard a familiar",
+    "git commit -m 'fix bug' && git",
+    "The opposite of 'increase' is",
+    "In Python, a list comprehension like [x*2 for x in",
+    "<!DOCTYPE html>\n<html>\n<head>\n    <title>",
+]
+
+# Deployment-like gen_prompts (the receiver-side live tokens c2c_edge appends after the fused KV).
+# Training over a mix makes the fuser robust to the gateway appending a prompt before generation.
+DISTILL_PROMPTS = [" ", "\n", "\n[TASK] Continue.\n\n[Solution]\n", "\n    "]
+
+
+def _build_distill_samples(ctx, contexts, n_cont):
+    """Per context: fuse inputs (recv==share) + a cycled deployment gen_prompt + the receiver's own
+    gate0 greedy continuation AFTER that prompt. The supervised feed is ``[gen_prompt, gate0[:-1]]`` and
+    the teacher is gate0's distribution over the WHOLE feed, so BOTH the prompt-prefill positions and
+    the generation positions are matched to gate0 (Lever-2.5: fix the perturbation baked into the
+    prompt before the first generation token)."""
+    samples = []
+    for k, text in enumerate(contexts):
+        fi = _fuse_inputs(ctx, text, text)
+        prompt = DISTILL_PROMPTS[k % len(DISTILL_PROMPTS)]
+        pid = ctx["rtok"](prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        g0_toks, _ = _greedy_rollout(ctx, fi["recv_layers"], fi["r_ids"], n_cont, pid)
+        feed = _feed(pid, g0_toks)
+        with torch.no_grad():
+            full = torch.softmax(_feed_logits(ctx, fi["recv_layers"], fi["r_ids"], feed), -1)
+        samples.append({"fi": fi, "pid": pid, "prompt": prompt, "g0_toks": g0_toks,
+                        "g0_feed": feed, "g0_full": full, "op_feed": feed, "op_full": full})
+    return samples
 
 
 def train_distill(ctx, *, steps=60, lr=0.05, gate=0.3, n_cont=8, on_policy=True, reroll=4,
@@ -305,6 +435,13 @@ def train_distill(ctx, *, steps=60, lr=0.05, gate=0.3, n_cont=8, on_policy=True,
     re-roll the FUSED model's own greedy trajectory and train it to match gate0's distribution at
     *those* (visited) prefixes — plus a gate0 anchor for stability. Checkpoints are selected by the
     honest FREE-generation metric (token-match vs gate0 + max-repeat), not teacher-forced KL.
+
+    The KL is taken over the WHOLE deployment feed ``[gen_prompt, trajectory[:-1]]`` (see
+    ``_feed_logits``) — prompt-prefill positions AND generation positions — so the fused prompt hidden
+    states are pulled toward gate0, not just the generation outputs. In the deployment regime the
+    receiver computes the gen_prompt by attending to the perturbed fused ctx KV, so supervising only
+    generation positions leaves that perturbation uncorrected (it is baked in before the first
+    generation token).
     """
     fuser = ctx["fuser"]
     torch.manual_seed(seed)
@@ -313,43 +450,39 @@ def train_distill(ctx, *, steps=60, lr=0.05, gate=0.3, n_cont=8, on_policy=True,
     fuser.gate_logit.requires_grad_(False)
     warmup = steps // 3 if warmup is None else warmup
 
-    samples = []                                            # recv==share; gate0 trajectory = warm-up teacher
-    for text in DISTILL_CONTEXTS:
-        fi = _fuse_inputs(ctx, text, text)
-        g0_toks, g0_logits = _greedy_rollout(ctx, fi["recv_layers"], fi["r_ids"], n_cont)
-        s = {"fi": fi, "g0_toks": g0_toks, "g0_probs": torch.softmax(g0_logits, -1).detach()}
-        s["op_toks"], s["op_probs"] = s["g0_toks"], s["g0_probs"]   # on-policy trajectory (refreshed)
-        samples.append(s)
+    train_samples = _build_distill_samples(ctx, DISTILL_CONTEXTS, n_cont)
+    held_samples = _build_distill_samples(ctx, HELDOUT_CONTEXTS, n_cont)   # gate progress on these
 
     def _fused_layers(s):
         return fuser.fuse(s["fi"]["recv_layers"], s["fi"]["sK"], s["fi"]["sV"],
                           s["fi"]["sp"], s["fi"]["gidx"], s["fi"]["rp"])
 
-    def _kl_on(s, toks, t_probs):                           # student fused, teacher-forced on `toks`
-        sl = _continuation_logits(ctx, _fused_layers(s), s["fi"]["r_ids"], toks)
-        return sum(distill_kl(sl[p], t_probs[p]) for p in range(len(toks))) / len(toks)
+    def _full_kl(s, feed, teacher_full):                    # student fused vs gate0 over the WHOLE feed
+        sl = _feed_logits(ctx, _fused_layers(s), s["fi"]["r_ids"], feed)
+        return sum(distill_kl(sl[p], teacher_full[p]) for p in range(feed.shape[1])) / feed.shape[1]
 
-    def _refresh_on_policy(s):                              # roll the FUSED model's own trajectory
+    def _refresh_on_policy(s):                              # roll the FUSED trajectory; teacher = gate0 on it
         with torch.no_grad():
-            f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont)
-            t_logits = _continuation_logits(ctx, s["fi"]["recv_layers"], s["fi"]["r_ids"], f_toks)
-        s["op_toks"], s["op_probs"] = f_toks, torch.softmax(t_logits, -1).detach()
+            f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont, s["pid"])
+            feed = _feed(s["pid"], f_toks)
+            s["op_feed"] = feed
+            s["op_full"] = torch.softmax(_feed_logits(ctx, s["fi"]["recv_layers"], s["fi"]["r_ids"], feed), -1)
 
-    def free_gen_metrics():                                # the HONEST metric: free-roll fused vs gate0
+    def free_gen_metrics(samples):                         # HONEST metric: free-roll fused vs gate0
         fuser.eval()
         match, rep = [], []
         with torch.no_grad():
             for s in samples:
-                f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont)
+                f_toks, _ = _greedy_rollout(ctx, _fused_layers(s), s["fi"]["r_ids"], n_cont, s["pid"])
                 match.append(float(np.mean([f == g for f, g in zip(f_toks, s["g0_toks"])])))
                 rep.append(_max_repeat(f_toks))
         return float(np.mean(match)), float(np.mean(rep))
 
-    m0, r0 = free_gen_metrics()
-    g0_rep = float(np.mean([_max_repeat(s["g0_toks"]) for s in samples]))
-    print(f"[distill] gate={gate} (frozen) | contexts={len(samples)} | n_cont={n_cont} | steps={steps} "
-          f"| on_policy={on_policy} warmup={warmup} reroll={reroll}")
-    print(f"  baseline free-gen: token-match-vs-gate0={m0:.0%}  max-repeat={r0:.1f}  (gate0 itself={g0_rep:.1f})")
+    m0_tr, _ = free_gen_metrics(train_samples)
+    m0, r0 = free_gen_metrics(held_samples)
+    print(f"[distill] gate={gate} (frozen) | train={len(train_samples)} held-out={len(held_samples)} | "
+          f"n_cont={n_cont} steps={steps} on_policy={on_policy} warmup={warmup} reroll={reroll} | +gen_prompt regime +prompt-pos KL")
+    print(f"  baseline free-gen: HELD-OUT match={m0:.0%} max-repeat={r0:.1f}  (train match={m0_tr:.0%})")
 
     opt = torch.optim.Adam([p for p in fuser.parameters() if p.requires_grad], lr=lr)
     best = {"match": m0, "rep": r0, "state": {k: v.detach().clone() for k, v in fuser.state_dict().items()}}
@@ -357,35 +490,37 @@ def train_distill(ctx, *, steps=60, lr=0.05, gate=0.3, n_cont=8, on_policy=True,
         fuser.eval()                                        # frozen gate -> deterministic; Wk/Wv still train
         on_pol = on_policy and step >= warmup
         if on_pol and step % reroll == 0:
-            for s in samples:
+            for s in train_samples:
                 _refresh_on_policy(s)
         opt.zero_grad()
         loss = 0.0
-        for s in samples:
+        for s in train_samples:
             if on_pol:                                      # on-policy term + gate0 anchor (DAgger mix)
-                loss = loss + _kl_on(s, s["op_toks"], s["op_probs"]) + 0.5 * _kl_on(s, s["g0_toks"], s["g0_probs"])
+                loss = loss + _full_kl(s, s["op_feed"], s["op_full"]) + 0.5 * _full_kl(s, s["g0_feed"], s["g0_full"])
             else:
-                loss = loss + _kl_on(s, s["g0_toks"], s["g0_probs"])
-        loss = loss / len(samples)
+                loss = loss + _full_kl(s, s["g0_feed"], s["g0_full"])
+        loss = loss / len(train_samples)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in fuser.parameters() if p.requires_grad], 10.0)
         opt.step()
         if step % 4 == 0 or step == steps - 1:
-            m, r = free_gen_metrics()
+            m, r = free_gen_metrics(held_samples)           # select + report on HELD-OUT (generalization)
             phase = "on-policy" if on_pol else "warmup"
-            print(f"  step {step:2d} ({phase}) | loss {loss.item():.4f} | free-gen match {m:.0%} max-repeat {r:.1f}")
-            if (m, -r) > (best["match"], -best["rep"]):     # select by free-gen match, tie-break on repetition
+            print(f"  step {step:2d} ({phase}) | loss {loss.item():.4f} | held-out match {m:.0%} max-repeat {r:.1f}")
+            if (m, -r) > (best["match"], -best["rep"]):
                 best = {"match": m, "rep": r,
                         "state": {k: v.detach().clone() for k, v in fuser.state_dict().items()}}
 
-    fuser.load_state_dict(best["state"])                    # restore the best-by-free-gen checkpoint
+    fuser.load_state_dict(best["state"])                    # restore the best-by-held-out checkpoint
     fuser.gate_logit.requires_grad_(True)
     m1, r1 = best["match"], best["rep"]
-    print("\n[distill verdict] (free-gen token-match vs gate0; higher match / lower repeat = less degeneration)")
-    print(f"  free-gen match: {m0:.0%} -> {m1:.0%}   max-repeat: {r0:.1f} -> {r1:.1f}  (best-by-free-gen checkpoint)")
-    print(f"  {'OK: fused free generation tracks the receiver-alone output more closely.' if m1 > m0 else 'NO improvement.'}")
+    m1_tr, _ = free_gen_metrics(train_samples)
+    print("\n[distill verdict] HELD-OUT free-gen token-match vs gate0 (the generalization metric)")
+    print(f"  held-out match: {m0:.0%} -> {m1:.0%}   max-repeat: {r0:.1f} -> {r1:.1f}   (train match now {m1_tr:.0%})")
+    print(f"  {'OK: GENERALIZES -- fused free generation tracks gate0 on UNSEEN contexts.' if m1 > m0 + 0.05 else 'limited held-out gain (overfit / data-scale frontier).'}")
     return {"objective": "distill", "gate": gate, "steps": steps, "n_cont": n_cont, "on_policy": on_policy,
-            "metrics": {"match_before": m0, "match_after": m1, "rep_before": r0, "rep_after": r1}}
+            "metrics": {"held_match_before": m0, "held_match_after": m1, "held_rep_before": r0,
+                        "held_rep_after": r1, "train_match_after": m1_tr}}
 
 
 # ============================================================
@@ -437,6 +572,9 @@ def main() -> None:
     ap.add_argument("--gate", type=float, default=0.3, help="distill: frozen gate; relational: init gate")
     ap.add_argument("--n-neg", type=int, default=3); ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--reroll", type=int, default=4, help="distill on-policy: re-roll fused trajectories every K steps")
+    ap.add_argument("--warmup", type=int, default=None, help="distill: teacher-forced warm-up steps before on-policy (default steps//3)")
+    ap.add_argument("--fuser", choices=["linear", "mlp"], default="linear",
+                    help="fuser architecture: linear Wk/Wv (default) or a per-layer residual MLP (non-linear capacity)")
     ap.add_argument("--no-on-policy", action="store_false", dest="on_policy",
                     help="distill: disable on-policy (DAgger) refinement, warm-up teacher-forcing only")
     ap.set_defaults(on_policy=True)
@@ -450,17 +588,17 @@ def main() -> None:
     receiver = args.receiver or get("c2c", "receiver_model", "Qwen/Qwen2.5-0.5B-Instruct")
     out = args.out or f"checkpoints/{args.objective}.pt"
     init_gate = args.gate if args.objective == "relational" else 0.05
-    print(f"[load] sharer={sharer} -> receiver={receiver} (CPU, frozen) ...")
-    ctx = _setup(sharer, receiver, init_gate=init_gate, tau=float(get("c2c", "tau", 1.0)))
+    print(f"[load] sharer={sharer} -> receiver={receiver} (CPU, frozen) | fuser={args.fuser} ...")
+    ctx = _setup(sharer, receiver, init_gate=init_gate, tau=float(get("c2c", "tau", 1.0)), fuser_arch=args.fuser)
 
     if args.objective == "relational":
         meta = train_relational(ctx, steps=args.steps or 30, lr=args.lr or 0.08, margin=2.0,
                                 n_neg=args.n_neg, top_k=args.top_k, seed=args.seed)
     else:
         meta = train_distill(ctx, steps=args.steps or 60, lr=args.lr or 0.05, gate=args.gate,
-                             on_policy=args.on_policy, reroll=args.reroll, seed=args.seed)
+                             on_policy=args.on_policy, reroll=args.reroll, warmup=args.warmup, seed=args.seed)
 
-    meta["sharer_model"] = sharer; meta["receiver_model"] = receiver
+    meta["sharer_model"] = sharer; meta["receiver_model"] = receiver; meta["fuser_arch"] = args.fuser
     path = save_fuser(ctx["fuser"], out, sharer_model=sharer, receiver_model=receiver,
                       sharer_shape=ctx["s_shape"], receiver_shape=ctx["r_shape"], metadata=meta)
     print(f"\n[saved] {path}  (load via TRINITY_C2C_FUSER={path} or config c2c.fuser_path)")
