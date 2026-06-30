@@ -27,9 +27,13 @@ type            when                         payload fields (besides the common 
 ``verdict``     a Verifier turn was parsed   step, verdict, accepted, artifact_chars
 ``error``       a turn failed / was empty    step, role, model_key, model_name, message
 ``final``       the run is returning         accepted, error, final, final_chars, turns
+``artifact``    a body was externalized to   artifact_id, kind, content_chars, ref_type, ref_seq
+                the CAS (trinity.persist)    (companion record; seq=None, carries its own art_seq)
 ==============  ===========================  =================================================
 
-Every event also carries the common fields: ``{type, run_id, seq, ts}``.
+Every event also carries the common fields: ``{type, run_id, seq, ts}`` — except the ``artifact``
+companion record, which is log bookkeeping written by :mod:`trinity.persist` (``seq`` is ``None``;
+ordering uses its own ``art_seq``), not an orchestration event from :class:`EventEmitter`.
 """
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ TURN_END = "turn_end"
 VERDICT = "verdict"
 ERROR = "error"
 FINAL = "final"
+ARTIFACT = "artifact"     # a body was externalized to the content-addressed store (see trinity.persist)
 
 
 def new_run_id() -> str:
